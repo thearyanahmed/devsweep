@@ -3,8 +3,8 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::SystemTime;
 
@@ -57,24 +57,45 @@ pub fn scan(roots: &[PathBuf]) -> Vec<Artifact> {
         find(root, &mut found);
     }
 
-    // Measuring is most of the time (node_modules has a lot of files): spread it over the cores.
-    let slots: Vec<Mutex<Artifact>> = found.into_iter().map(Mutex::new).collect();
+    // Measuring is most of the time (node_modules has tens of thousands of files), and the git checks are
+    // subprocesses: run both at once, each spread over the cores.
+    let paths: Vec<&Path> = found.iter().map(|a| a.path.as_path()).collect();
+    let (measures, verdicts) = thread::scope(|s| {
+        let git = s.spawn(|| parallel_map(&found, git_verdict));
+        (measure_all(&paths), git.join().unwrap())
+    });
+    for ((a, m), verdict) in found.iter_mut().zip(measures).zip(verdicts) {
+        (a.bytes, a.shared, a.files, a.last_built) = (m.bytes, m.shared, m.files, m.last_built);
+        if let Some((safety, why)) = verdict {
+            a.safety = a.safety.max(safety);
+            a.why = why;
+        }
+    }
+    found
+}
+
+fn workers() -> usize {
+    thread::available_parallelism().map_or(4, |n| n.get())
+}
+
+/// `f` over every item, on all cores, keeping the order.
+fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let next = AtomicUsize::new(0);
-    let workers = thread::available_parallelism().map_or(4, |n| n.get());
+    let out: Vec<Mutex<Option<R>>> = items.iter().map(|_| Mutex::new(None)).collect();
     thread::scope(|s| {
-        for _ in 0..workers {
+        for _ in 0..workers().min(items.len()) {
             s.spawn(|| {
-                while let Some(slot) = slots.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    let mut a = slot.lock().unwrap();
-                    let m = measure(&a.path);
-                    (a.bytes, a.shared, a.files, a.last_built) =
-                        (m.bytes, m.shared, m.files, m.last_built);
-                    check_git(&mut a);
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    *out[i].lock().unwrap() = Some(f(item));
                 }
             });
         }
     });
-    slots.into_iter().map(|m| m.into_inner().unwrap()).collect()
+    out.into_iter()
+        .map(|m| m.into_inner().unwrap().unwrap())
+        .collect()
 }
 
 /// Walks `dir` in name order, collecting artifacts without descending into them.
@@ -124,90 +145,152 @@ pub struct Measure {
     pub last_built: Option<SystemTime>,
 }
 
-/// Size, file count and newest modification time. A hard-linked file counts once, and counts as shared only when
-/// some of its links live outside `root` (deleting it doesn't free it then).
+/// Size, file count and newest modification time of one directory tree.
 pub fn measure(root: &Path) -> Measure {
-    struct Inode {
-        size: u64,
-        nlink: u64,
-        seen: u64,
-    }
-    fn walk(p: &Path, m: &mut Measure, links: &mut HashMap<u64, Inode>) {
-        let Ok(md) = fs::symlink_metadata(p) else {
-            return;
-        };
-        if let Ok(t) = md.modified()
-            && m.last_built.is_none_or(|last| t > last)
-        {
-            m.last_built = Some(t);
-        }
-        let size = md.blocks() * 512;
-        let is_dir = md.is_dir();
-        let mut counted = true;
-        if !is_dir && md.nlink() > 1 {
-            match links.get_mut(&md.ino()) {
-                Some(n) => {
-                    n.seen += 1;
-                    counted = false;
-                }
-                None => {
-                    links.insert(
-                        md.ino(),
-                        Inode {
-                            size,
-                            nlink: md.nlink(),
-                            seen: 1,
-                        },
-                    );
-                }
-            }
-        }
-        if counted {
-            m.bytes += size;
-            if !is_dir {
-                m.files += 1;
-            }
-        }
-        if is_dir && let Ok(entries) = fs::read_dir(p) {
-            for e in entries.flatten() {
-                walk(&e.path(), m, links);
-            }
-        }
-    }
-
-    let mut m = Measure::default();
-    let mut links = HashMap::new();
-    walk(root, &mut m, &mut links);
-    m.shared = links
-        .values()
-        .filter(|n| n.seen < n.nlink)
-        .map(|n| n.size)
-        .sum();
-    m
+    measure_all(&[root]).pop().unwrap_or_default()
 }
 
-/// Downgrades an artifact whose contents git tracks, and notes one that isn't gitignored.
-fn check_git(a: &mut Artifact) {
-    if !a.project.ancestors().any(|d| exists(&d.join(".git"))) {
-        return;
+/// What one worker saw of one tree. Hard-linked files are kept aside by inode, so the merge can count each once.
+#[derive(Default)]
+struct Partial {
+    bytes: u64,
+    files: u64,
+    last_built: Option<SystemTime>,
+    /// inode -> (size, link count, links seen)
+    links: HashMap<u64, (u64, u64, u64)>,
+}
+
+impl Partial {
+    fn add(&mut self, md: &fs::Metadata) {
+        if let Ok(t) = md.modified()
+            && self.last_built.is_none_or(|last| t > last)
+        {
+            self.last_built = Some(t);
+        }
+        let size = md.blocks() * 512;
+        if md.is_dir() {
+            self.bytes += size;
+        } else if md.nlink() > 1 {
+            self.links
+                .entry(md.ino())
+                .or_insert((size, md.nlink(), 0))
+                .2 += 1;
+        } else {
+            self.bytes += size;
+            self.files += 1;
+        }
     }
-    let Ok(out) = Command::new("git")
+}
+
+/// Measures several trees at once with one pool of threads sharing a queue of directories, so a single huge tree
+/// (node_modules) is spread over every core too. A hard-linked file counts once, and counts as shared only when some
+/// of its links live outside its tree (deleting the tree doesn't free it then).
+pub fn measure_all(roots: &[&Path]) -> Vec<Measure> {
+    // The queue holds (tree, directory, is the tree's root) and how many directories are queued or being read.
+    let queue = Mutex::new((
+        roots
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, p.to_path_buf(), true))
+            .collect::<Vec<_>>(),
+        roots.len(),
+    ));
+    let wake = Condvar::new();
+    let partials: Vec<Vec<Partial>> = thread::scope(|s| {
+        let handles: Vec<_> = (0..workers())
+            .map(|_| {
+                s.spawn(|| {
+                    let mut mine: Vec<Partial> = roots.iter().map(|_| Partial::default()).collect();
+                    loop {
+                        let next = {
+                            let mut q = queue.lock().unwrap();
+                            loop {
+                                if let Some(item) = q.0.pop() {
+                                    break Some(item);
+                                }
+                                if q.1 == 0 {
+                                    break None;
+                                }
+                                q = wake.wait(q).unwrap();
+                            }
+                        };
+                        let Some((i, dir, is_root)) = next else {
+                            return mine;
+                        };
+                        let mut subdirs = Vec::new();
+                        let read = !is_root
+                            || fs::symlink_metadata(&dir).is_ok_and(|md| {
+                                mine[i].add(&md);
+                                md.is_dir()
+                            });
+                        if read && let Ok(entries) = fs::read_dir(&dir) {
+                            for e in entries.flatten() {
+                                // DirEntry::metadata doesn't follow symlinks, and is cheaper than a stat by path.
+                                let Ok(md) = e.metadata() else { continue };
+                                mine[i].add(&md);
+                                if md.is_dir() {
+                                    subdirs.push((i, e.path(), false));
+                                }
+                            }
+                        }
+                        let mut q = queue.lock().unwrap();
+                        q.1 += subdirs.len();
+                        q.1 -= 1;
+                        let more = !subdirs.is_empty();
+                        q.0.extend(subdirs);
+                        if more || q.1 == 0 {
+                            wake.notify_all();
+                        }
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    (0..roots.len())
+        .map(|i| {
+            let mut m = Measure::default();
+            let mut links: HashMap<u64, (u64, u64, u64)> = HashMap::new();
+            for p in partials.iter().map(|w| &w[i]) {
+                m.bytes += p.bytes;
+                m.files += p.files;
+                m.last_built = m.last_built.max(p.last_built);
+                for (&ino, &(size, nlink, seen)) in &p.links {
+                    links.entry(ino).or_insert((size, nlink, 0)).2 += seen;
+                }
+            }
+            for (size, nlink, seen) in links.into_values() {
+                m.bytes += size;
+                m.files += 1;
+                if seen < nlink {
+                    m.shared += size;
+                }
+            }
+            m
+        })
+        .collect()
+}
+
+/// Whether git changes an artifact's safety: unsafe when git tracks files in it, caution when it isn't gitignored.
+fn git_verdict(a: &Artifact) -> Option<(Safety, String)> {
+    if !a.project.ancestors().any(|d| exists(&d.join(".git"))) {
+        return None;
+    }
+    let out = Command::new("git")
         .arg("-C")
         .arg(&a.project)
         .args(["ls-files", "--", &a.dir])
         .stderr(Stdio::null())
         .output()
-    else {
-        return;
-    };
-    if !out.status.success() {
-        return;
-    }
+        .ok()
+        .filter(|o| o.status.success())?;
     let tracked = out.stdout.iter().filter(|&&b| b == b'\n').count();
     if tracked > 0 {
-        a.safety = Safety::Unsafe;
-        a.why = format!("{} tracked in git", plural(tracked, "file"));
-        return;
+        return Some((
+            Safety::Unsafe,
+            format!("{} tracked in git", plural(tracked, "file")),
+        ));
     }
     let ignored = Command::new("git")
         .arg("-C")
@@ -215,10 +298,7 @@ fn check_git(a: &mut Artifact) {
         .args(["check-ignore", "-q", &a.dir])
         .status()
         .is_ok_and(|s| s.success());
-    if !ignored {
-        a.safety = a.safety.max(Safety::Caution);
-        a.why = join(&a.why, "not gitignored");
-    }
+    (!ignored).then(|| (Safety::Caution, join(&a.why, "not gitignored")))
 }
 
 fn join(a: &str, b: &str) -> String {

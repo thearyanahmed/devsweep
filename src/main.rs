@@ -238,11 +238,14 @@ fn main() {
         })
         .collect();
 
+    // The shared caches don't depend on the projects: measure them at the same time.
+    let pending_caches = o.caches.then(|| std::thread::spawn(caches::caches));
+    let caches = move || pending_caches.map(|t| t.join().unwrap());
     let all = scan::scan(&roots);
     let arts = filter(&all, &o);
 
     if clean {
-        let caches = if o.caches { caches::caches() } else { vec![] };
+        let caches = caches().unwrap_or_default();
         process::exit(clean::run_clean(&roots, &arts, &caches, &o));
     }
 
@@ -257,7 +260,7 @@ fn main() {
         }
         let out = Out {
             artifacts: &arts,
-            caches: o.caches.then(caches::caches),
+            caches: caches(),
             roots: &roots,
         };
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
@@ -289,7 +292,7 @@ fn main() {
         }
     }
     if o.caches {
-        print_caches(&mut caches::caches());
+        print_caches(&mut caches().unwrap_or_default());
     }
 }
 

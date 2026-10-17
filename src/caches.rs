@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::output::tilde;
 use crate::rules::{Safety, exists};
-use crate::scan::measure;
+use crate::scan::measure_all;
 
 /// A shared, tool-wide cache outside any project.
 #[derive(Serialize)]
@@ -59,14 +59,30 @@ pub fn caches() -> Vec<Cache> {
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     let h = |p: &str| home.join(p);
     let cargo_note = "cargo also trims it on its own";
+    // Asking the tools where their caches are means starting go, pnpm (through node) and docker: do it all at once.
+    let docker = on_path("docker").then(|| thread::spawn(docker_reclaimable));
+    let (go, pnpm) = thread::scope(|s| {
+        let pnpm = s.spawn(|| pnpm_store(h("Library/pnpm/store")));
+        let go = output("go", &["env", "GOCACHE", "GOMODCACHE"]).unwrap_or_default();
+        (go, pnpm.join().unwrap())
+    });
+    let mut go = go.lines().map(PathBuf::from);
+    let gocache = go
+        .next()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| h("Library/Caches/go-build"));
+    let gomodcache = go
+        .next()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| h("go/pkg/mod"));
     let list = vec![
         cache("cargo registry", h(".cargo/registry/cache"), &[]).note(cargo_note),
         cache("cargo registry src", h(".cargo/registry/src"), &[]).note(cargo_note),
         cache("cargo git", h(".cargo/git/checkouts"), &[]),
-        cache("go build cache", goenv("GOCACHE", h("Library/Caches/go-build")), &["go", "clean", "-cache"]),
-        cache("go module cache", goenv("GOMODCACHE", h("go/pkg/mod")), &["go", "clean", "-modcache"]),
+        cache("go build cache", gocache, &["go", "clean", "-cache"]),
+        cache("go module cache", gomodcache, &["go", "clean", "-modcache"]),
         cache("npm cache", h(".npm"), &["npm", "cache", "clean", "--force"]),
-        cache("pnpm store", pnpm_store(h("Library/pnpm/store")), &["pnpm", "store", "prune"])
+        cache("pnpm store", pnpm, &["pnpm", "store", "prune"])
             .note("keeps packages a project still uses; prunes the store of the pnpm on PATH"),
         cache("yarn cache", h("Library/Caches/Yarn"), &["yarn", "cache", "clean"]),
         cache("bun cache", h(".bun/install/cache"), &["bun", "pm", "cache", "rm"]),
@@ -101,17 +117,21 @@ pub fn caches() -> Vec<Cache> {
             }
         })
         .collect();
-    thread::scope(|s| {
-        for c in &mut list {
-            s.spawn(move || {
-                c.bytes = if c.docker {
-                    docker_reclaimable()
-                } else {
-                    measure(&c.path).bytes
-                };
-            });
-        }
-    });
+    // One pass over every cache directory, while Docker answers.
+    let paths: Vec<&Path> = list
+        .iter()
+        .filter(|c| !c.docker)
+        .map(|c| c.path.as_path())
+        .collect();
+    let mut sizes = measure_all(&paths).into_iter();
+    let docker = docker.map_or(0, |d| d.join().unwrap_or(0));
+    for c in &mut list {
+        c.bytes = if c.docker {
+            docker
+        } else {
+            sizes.next().unwrap().bytes
+        };
+    }
     // Docker not running, or nothing to reclaim: leave it out.
     list.retain(|c| c.bytes != 0);
     list
@@ -125,10 +145,6 @@ fn output(cmd: &str, args: &[&str]) -> Option<String> {
         .ok()?;
     let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
     (out.status.success() && !s.is_empty()).then_some(s)
-}
-
-fn goenv(var: &str, default: PathBuf) -> PathBuf {
-    output("go", &["env", var]).map_or(default, PathBuf::from)
 }
 
 /// `pnpm store path` names one store version (…/store/v10); measure every version beside it.
