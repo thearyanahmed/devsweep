@@ -123,8 +123,8 @@ pub fn summary(roots: &[PathBuf], arts: &[&Artifact]) {
     );
 }
 
-/// Aligns cells into columns two spaces apart, exactly like Go's tabwriter: a cell's width is its character count,
-/// color codes included, which gives colored columns their extra breathing room. The last cell of a row isn't padded.
+/// Aligns cells into columns two spaces apart, like Go's tabwriter, but by the width that shows on screen: color
+/// codes don't count, so a dimmed or colored column lines up with its header. The last cell of a row isn't padded.
 struct Table(Vec<Vec<String>>);
 
 impl Table {
@@ -167,16 +167,28 @@ impl Table {
     }
 }
 
+/// Characters that show on screen, skipping color codes (ESC [ ... m).
 fn width(s: &str) -> usize {
-    s.chars().count()
+    let mut n = 0;
+    let mut in_code = false;
+    for c in s.chars() {
+        match (in_code, c) {
+            (false, '\x1b') => in_code = true,
+            (true, 'm') => in_code = false,
+            (true, _) => {}
+            (false, _) => n += 1,
+        }
+    }
+    n
 }
 
 /// How clean removes an artifact; rm -rf stands out since it needs -rm.
+/// How clean removes an artifact: a tool's command dim like the other details, rm -rf in magenta since it needs -rm.
 fn method(a: &Artifact) -> String {
     if a.clean.is_none() {
         paint("35", &a.method())
     } else {
-        a.method()
+        dim(&a.method())
     }
 }
 
@@ -194,7 +206,7 @@ pub fn print_list(root: &Path, arts: &[&Artifact]) {
     for a in arts {
         let mut note = a.rebuild.clone();
         if !a.why.is_empty() {
-            note += &dim(&format!("  ({})", a.why));
+            note = format!("{note}  ({})", a.why);
         }
         let mut size = human(a.freed());
         if a.shared > 0 {
@@ -206,9 +218,9 @@ pub fn print_list(root: &Path, arts: &[&Artifact]) {
             a.kind.into(),
             rel(root, &a.project),
             a.dir.clone(),
-            ago(a.last_built),
+            dim(&ago(a.last_built)),
             method(a),
-            note,
+            dim(&note),
         ]);
     }
     t.print();
@@ -222,7 +234,8 @@ struct Node<'a> {
     art: Option<&'a Artifact>,
 }
 
-pub fn print_tree(root: &Path, arts: &[&Artifact]) {
+/// The summary line above names the root, so the root gets a line of its own only when there are several.
+pub fn print_tree(root: &Path, arts: &[&Artifact], name_root: bool) {
     let mut top = Node::default();
     for a in arts {
         let mut n = &mut top;
@@ -233,7 +246,9 @@ pub fn print_tree(root: &Path, arts: &[&Artifact]) {
         }
         n.art = Some(a);
     }
-    println!("{}  {}", bold(&tilde(root)), human(top.bytes));
+    if name_root {
+        println!("{}  {}", bold(&tilde(root)), human(top.bytes));
+    }
     walk_tree(&top, "");
 }
 
@@ -326,8 +341,8 @@ mod tests {
     }
 
     #[test]
-    fn width_counts_color_codes_like_go() {
-        assert_eq!(width("\x1b[32msafe\x1b[0m"), 13);
+    fn width_skips_color_codes() {
+        assert_eq!(width("\x1b[32msafe\x1b[0m"), 4);
         assert_eq!(width("└── a"), 5);
     }
 }

@@ -284,14 +284,14 @@ fn main() {
         return;
     }
 
+    // The summary heads the listing: the note and the table or tree follow it directly.
     summary(&roots, &shown);
-    println!();
     if all.is_empty() {
         println!("{}", dim("nothing found"));
     }
     let hidden = all.len() - shown.len();
     if hidden > 0 {
-        println!("{}\n", dim(&hidden_note(&all, &shown, hidden, &o)));
+        println!("{}", dim(&hidden_note(&all, &shown, hidden, &o)));
     }
     for root in &roots {
         let under: Vec<&Artifact> = shown
@@ -303,7 +303,7 @@ fn main() {
             continue;
         }
         if o.tree {
-            print_tree(root, &under);
+            print_tree(root, &under, roots.len() > 1);
         } else {
             print_list(root, &under);
         }
