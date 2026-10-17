@@ -1,7 +1,7 @@
 .PHONY: build install test
 build:            ## ./devsweep
-	go build -o devsweep .
-install:          ## into $(go env GOBIN), ~/go/bin here
-	go install .
+	cargo build --release && cp target/release/devsweep .
+install:          ## into ~/.cargo/bin
+	cargo install --path .
 test:
-	go vet ./... && go test ./...
+	cargo clippy --all-targets -- -D warnings && cargo test
