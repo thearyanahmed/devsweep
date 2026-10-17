@@ -8,36 +8,23 @@ mod rules;
 mod scan;
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::time::{Duration, SystemTime};
 
-use output::{ago, dim, human, plural, print_caches, print_list, print_tree, summary};
+use output::{
+    Group, ago, bold, dim, group_heading, groups, human, plural, print_caches, print_list,
+    print_tree, reset, safety_label, summary, tilde,
+};
+use rules::Safety;
 use scan::Artifact;
-
-const USAGE: &str = "devsweep: what your projects' build output is costing you, and cleaning it up.
-
-Usage:
-  devsweep [flags] [dirs...]         list artifacts (default dir: ~/dev)
-  devsweep clean [flags] [dirs...]   clean them, after asking
-
-Cleaning runs each tool's own command in the project (cargo clean, mix clean, swift package reset, npm run clean,
-go clean -cache, brew cleanup, docker system prune, ...). Things no tool can clean (node_modules, .next, __pycache__)
-show as \"rm -rf\" and are only removed with -rm. With -caches, shared tool caches are offered one by one too.
-
-Safety:
-  safe      the project's own tooling recreates it exactly (lockfile present, gitignored)
-  caution   probably recreatable, but may differ or hold something you want (dist/, no lockfile, not gitignored)
-  unsafe    git tracks files in it; never deleted
-
-Flags:
-";
 
 /// A command-line flag, Go style: `-name`, `--name`, `-name=value` or `-name value`.
 struct Flag {
     name: &'static str,
-    /// Empty for a boolean flag.
-    kind: &'static str,
+    /// Takes a value (`-min 1G`); otherwise a switch that is on when given (`-tree`).
+    takes_value: bool,
     default: &'static str,
     usage: &'static str,
 }
@@ -45,7 +32,7 @@ struct Flag {
 const fn flag(name: &'static str, usage: &'static str) -> Flag {
     Flag {
         name,
-        kind: "",
+        takes_value: false,
         default: "",
         usage,
     }
@@ -54,7 +41,7 @@ const fn flag(name: &'static str, usage: &'static str) -> Flag {
 const fn string(name: &'static str, default: &'static str, usage: &'static str) -> Flag {
     Flag {
         name,
-        kind: "string",
+        takes_value: true,
         default,
         usage,
     }
@@ -68,12 +55,13 @@ const FLAGS: &[Flag] = &[
     ),
     flag(
         "dry-run",
-        "clean: show what would be deleted, delete nothing",
+        "clean: show what would run, run nothing; rm -rf is always a dry run unless --dry-run=false",
     ),
     flag(
         "include-caution",
         "clean: also offer caution artifacts, each asked one by one",
     ),
+    string("group", "", "group the listing by project, kind or safety"),
     flag("json", "print JSON"),
     string(
         "kind",
@@ -109,32 +97,88 @@ pub struct Options {
     pub json: bool,
     pub caches: bool,
     pub yes: bool,
-    pub dry_run: bool,
+    /// --dry-run as given: `None` leaves tool commands running and rm -rf as a dry run.
+    pub dry_run: Option<bool>,
     pub caution: bool,
     pub rm: bool,
     pub older: Option<Duration>,
     pub min: u64,
     pub kinds: Option<HashSet<String>>,
     pub sort_by: String,
+    pub group: Option<Group>,
     /// The string flags as given, for saying which ones hid artifacts.
     raw: BTreeMap<&'static str, String>,
 }
 
-fn usage() -> ! {
-    eprint!("{USAGE}");
+/// The help text: what you type at full brightness, what explains it faint. A shell that leaves output faint (SGR 2)
+/// gets reset first, so the plain parts really are full brightness.
+fn help() -> String {
+    let flag = spelled;
+    let mut h = format!(
+        "{}{}{}
+
+{}
+  devsweep [flags] [dirs...]         {}
+  devsweep clean [flags] [dirs...]   {}
+
+{}{}{}{}{}{}{}
+
+{}
+  {}      {}
+  {}   {}
+  {}    {}
+
+{}
+",
+        reset(),
+        bold("devsweep"),
+        dim(": what your projects' build output is costing you, and cleaning it up."),
+        bold("Usage:"),
+        dim("list artifacts (default dir: ~/dev)"),
+        dim("clean them, after asking"),
+        dim(
+            "Cleaning runs each tool's own command in the project (cargo clean, mix clean, swift package reset, npm run \
+             clean,\ngo clean -cache, brew cleanup, docker system prune, ...). Things no tool can clean (node_modules, \
+             .next, __pycache__)\nshow as \"rm -rf\" and are only removed with "
+        ),
+        flag("rm"),
+        dim(", and even then only shown until "),
+        flag("dry-run"),
+        dim("=false.\nWith "),
+        flag("caches"),
+        dim(", shared tool caches are offered one by one too."),
+        bold("Safety:"),
+        safety_label(Safety::Safe),
+        dim("the project's own tooling recreates it exactly (lockfile present, gitignored)"),
+        safety_label(Safety::Caution),
+        dim(
+            "probably recreatable, but may differ or hold something you want (dist/, no lockfile, not gitignored)"
+        ),
+        safety_label(Safety::Unsafe),
+        dim("git tracks files in it; never deleted"),
+        bold("Flags:"),
+    );
+    // Descriptions in a column beside the flags, three spaces past the longest one, as in the sections above.
+    let column = FLAGS.iter().map(|f| f.name.len() + 1).max().unwrap_or(0) + 3;
     for f in FLAGS {
-        let kind = if f.kind.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", f.kind)
-        };
         let default = if f.default.is_empty() {
             String::new()
         } else {
             format!(" (default {:?})", f.default)
         };
-        eprintln!("  -{}{kind}\n    \t{}{default}", f.name, f.usage);
+        let usage = dim(&format!("{}{default}", f.usage));
+        writeln!(h, "  {:<column$}{usage}", flag(f.name)).expect("writing to a String can't fail");
     }
+    h
+}
+
+/// Help asked for goes to stdout and exits 0; help after a mistake goes to stderr and exits 2.
+fn usage(mistake: bool) -> ! {
+    if mistake {
+        eprint!("{}", help());
+        process::exit(2)
+    }
+    print!("{}", help());
     process::exit(0)
 }
 
@@ -143,8 +187,36 @@ fn fail(msg: impl std::fmt::Display) -> ! {
     process::exit(2)
 }
 
-/// Parses flags anywhere among the dirs (devsweep ~/dev -tree), returning the flags set and the dirs.
-fn parse_args(args: &[String]) -> (BTreeMap<&'static str, String>, Vec<String>) {
+/// Why the command line couldn't be used.
+#[derive(Debug, PartialEq, Eq)]
+enum ArgError {
+    /// -h or --help: not a mistake.
+    Help,
+    /// A flag devsweep doesn't have, as typed.
+    Unknown(String),
+    /// A flag used wrongly.
+    Invalid(String),
+}
+
+/// How a flag is written: one dash for a single word (-tree), two for several (--dry-run).
+fn spelled(name: &str) -> String {
+    if name.contains('-') {
+        format!("--{name}")
+    } else {
+        format!("-{name}")
+    }
+}
+
+/// A parsed command line.
+#[derive(Debug)]
+struct Args {
+    /// The flags given, by name, with their values ("true" for a switch).
+    set: BTreeMap<&'static str, String>,
+    dirs: Vec<String>,
+}
+
+/// Parses flags anywhere among the dirs (devsweep ~/dev -tree).
+fn parse_args(args: &[String]) -> Result<Args, ArgError> {
     let mut set = BTreeMap::new();
     let mut dirs = Vec::new();
     let mut it = args.iter();
@@ -153,38 +225,47 @@ fn parse_args(args: &[String]) -> (BTreeMap<&'static str, String>, Vec<String>) 
             dirs.extend(it.by_ref().cloned());
             break;
         }
-        let Some(body) = arg
-            .strip_prefix("--")
-            .or_else(|| arg.strip_prefix('-'))
-            .filter(|b| !b.is_empty())
-        else {
+        let (double, body) = arg.strip_prefix("--").map_or_else(
+            || (false, arg.strip_prefix('-').unwrap_or_default()),
+            |body| (true, body),
+        );
+        if body.is_empty() {
             dirs.push(arg.clone());
             continue;
-        };
+        }
         let (name, value) = match body.split_once('=') {
             Some((n, v)) => (n, Some(v.to_owned())),
             None => (body, None),
         };
         if name == "h" || name == "help" {
-            usage();
+            return Err(ArgError::Help);
         }
         let Some(f) = FLAGS.iter().find(|f| f.name == name) else {
-            eprintln!("flag provided but not defined: -{name}");
-            usage();
+            return Err(ArgError::Unknown(
+                arg.split('=').next().unwrap_or(arg).to_owned(),
+            ));
         };
-        let value = match (f.kind.is_empty(), value) {
-            (true, None) => "true".to_owned(),
-            (true, Some(v)) if matches!(v.as_str(), "true" | "false" | "1" | "0") => v,
-            (true, Some(v)) => fail(format!("invalid boolean value {v:?} for -{name}")),
-            (false, Some(v)) => v,
-            (false, None) => it
+        let flag = spelled(f.name);
+        if f.name.contains('-') && !double {
+            return Err(ArgError::Invalid(format!("-{name} is written {flag}")));
+        }
+        let value = match (f.takes_value, value) {
+            (false, None) => "true".to_owned(),
+            (false, Some(v)) if matches!(v.as_str(), "true" | "false" | "1" | "0") => v,
+            (false, Some(v)) => {
+                return Err(ArgError::Invalid(format!(
+                    "invalid boolean value {v:?} for {flag}"
+                )));
+            }
+            (true, Some(v)) => v,
+            (true, None) => it
                 .next()
                 .cloned()
-                .unwrap_or_else(|| fail(format!("flag needs an argument: -{name}"))),
+                .ok_or_else(|| ArgError::Invalid(format!("flag needs an argument: {flag}")))?,
         };
         set.insert(f.name, value);
     }
-    (set, dirs)
+    Ok(Args { set, dirs })
 }
 
 /// A string flag's default value.
@@ -210,13 +291,20 @@ fn options(set: &BTreeMap<&'static str, String>) -> Options {
         json: on("json"),
         caches: on("caches"),
         yes: on("yes"),
-        dry_run: on("dry-run"),
+        dry_run: set.get("dry-run").map(|v| v == "true" || v == "1"),
         caution: on("include-caution"),
         rm: on("rm"),
         older: (!older.is_empty()).then(|| parse_age(&older).unwrap_or_else(|e| fail(e))),
         min: parse_size(&get("min")).unwrap_or_else(|e| fail(e)),
         kinds: (!kinds.is_empty()).then(|| kinds.split(',').map(|k| k.trim().to_owned()).collect()),
         sort_by: get("sort"),
+        group: match get("group").as_str() {
+            "" => None,
+            "project" => Some(Group::Project),
+            "kind" => Some(Group::Kind),
+            "safety" => Some(Group::Safety),
+            other => fail(format!("bad -group {other:?}: use project, kind or safety")),
+        },
         raw: ["older", "kind", "min"]
             .into_iter()
             .map(|n| (n, get(n)))
@@ -248,7 +336,15 @@ fn main() {
     if clean {
         args.remove(0);
     }
-    let (set, dirs) = parse_args(&args);
+    let Args { set, dirs } = match parse_args(&args) {
+        Ok(parsed) => parsed,
+        Err(ArgError::Help) => usage(false),
+        Err(ArgError::Unknown(flag)) => {
+            eprintln!("flag provided but not defined: {flag}");
+            usage(true)
+        }
+        Err(ArgError::Invalid(why)) => fail(why),
+    };
     let o = options(&set);
     let roots = resolve_roots(&dirs);
 
@@ -302,10 +398,21 @@ fn main() {
         if under.is_empty() {
             continue;
         }
-        if o.tree {
-            print_tree(root, &under, roots.len() > 1);
-        } else {
-            print_list(root, &under);
+        // The summary line names a single root; with several, each gets a heading.
+        if roots.len() > 1 {
+            let total: u64 = under.iter().map(|a| a.freed()).sum();
+            println!("{}  {}", bold(&tilde(root)), human(total));
+        }
+        match (o.tree, o.group) {
+            // The tree already groups by project, folder by folder.
+            (true, Some(by @ (Group::Kind | Group::Safety))) => {
+                for (name, members) in groups(root, &under, by, &o.sort_by) {
+                    println!("{}", group_heading(by, &name, &members));
+                    print_tree(root, &members);
+                }
+            }
+            (true, _) => print_tree(root, &under),
+            (false, group) => print_list(root, &under, group, &o.sort_by),
         }
     }
     if o.caches {
@@ -344,7 +451,7 @@ fn hidden_note(all: &[Artifact], shown: &[&Artifact], hidden: usize, o: &Options
     let mut why: Vec<String> = ["older", "kind", "min"]
         .into_iter()
         .filter(|n| o.raw[n] != default_of(n))
-        .map(|n| format!("-{n} {}", o.raw[n]))
+        .map(|n| format!("{} {}", spelled(n), o.raw[n]))
         .collect();
     if why.is_empty() {
         why.push(format!("-min {}", o.raw["min"]));
@@ -437,10 +544,28 @@ mod tests {
         let args: Vec<String> = ["~/a", "-tree", "--min=0", "-older", "3d", "~/b"]
             .map(String::from)
             .to_vec();
-        let (set, dirs) = parse_args(&args);
+        let Args { set, dirs } = parse_args(&args).unwrap();
         assert_eq!(dirs, ["~/a", "~/b"]);
         assert_eq!(set["tree"], "true");
         assert_eq!(set["min"], "0");
         assert_eq!(set["older"], "3d");
+    }
+
+    #[test]
+    fn multi_word_flags_take_two_dashes() {
+        let parse =
+            |args: &[&str]| parse_args(&args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>());
+        assert_eq!(parse(&["--dry-run"]).unwrap().set["dry-run"], "true");
+        assert_eq!(parse(&["--include-caution", "-rm"]).unwrap().set.len(), 2);
+        assert_eq!(
+            parse(&["-dry-run"]).unwrap_err(),
+            ArgError::Invalid("-dry-run is written --dry-run".into())
+        );
+        assert_eq!(parse(&["--tree"]).unwrap().set["tree"], "true");
+        assert_eq!(
+            parse(&["-nope=1"]).unwrap_err(),
+            ArgError::Unknown("-nope".into())
+        );
+        assert_eq!(parse(&["--help"]).unwrap_err(), ArgError::Help);
     }
 }

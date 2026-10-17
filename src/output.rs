@@ -23,6 +23,11 @@ pub fn paint(code: &str, s: &str) -> String {
     }
 }
 
+/// Clears whatever styling the terminal was left in, when writing in color.
+pub fn reset() -> &'static str {
+    if color() { "\x1b[0m" } else { "" }
+}
+
 pub fn dim(s: &str) -> String {
     paint("2", s)
 }
@@ -125,37 +130,65 @@ pub fn summary(roots: &[PathBuf], arts: &[&Artifact]) {
 
 /// Aligns cells into columns two spaces apart, like Go's tabwriter, but by the width that shows on screen: color
 /// codes don't count, so a dimmed or colored column lines up with its header. The last cell of a row isn't padded.
-struct Table(Vec<Vec<String>>);
+struct Table {
+    rows: Vec<Row>,
+    /// Spaces before every row of cells, so they sit under a group's heading.
+    indent: usize,
+}
+
+#[derive(Debug)]
+enum Row {
+    Cells(Vec<String>),
+    /// A line of its own, such as a group's heading: printed as is, and not part of any column.
+    Line(String),
+}
 
 impl Table {
     /// One dim span over the whole header line, split into its cells.
-    fn header(cols: &[&str]) -> Self {
-        Self(vec![
-            dim(&cols.join("\t"))
-                .split('\t')
-                .map(String::from)
-                .collect(),
-        ])
+    fn new(cols: &[&str], indent: usize) -> Self {
+        let header = dim(&cols.join("\t"))
+            .split('\t')
+            .map(String::from)
+            .collect();
+        Self {
+            rows: vec![Row::Cells(header)],
+            indent,
+        }
     }
 
     fn row(&mut self, cells: Vec<String>) {
-        self.0.push(cells);
+        self.rows.push(Row::Cells(cells));
+    }
+
+    fn line(&mut self, line: String) {
+        self.rows.push(Row::Line(line));
     }
 
     fn print(&self) {
-        let cols = self.0.iter().map(Vec::len).max().unwrap_or(0);
+        let cells = || {
+            self.rows.iter().filter_map(|r| match r {
+                Row::Cells(c) => Some(c),
+                Row::Line(_) => None,
+            })
+        };
+        let cols = cells().map(Vec::len).max().unwrap_or(0);
         let widths: Vec<usize> = (0..cols)
             .map(|i| {
-                self.0
-                    .iter()
+                cells()
                     .filter_map(|r| r.get(i))
                     .map(|c| width(c))
                     .max()
                     .unwrap_or(0)
             })
             .collect();
-        for row in &self.0 {
-            let mut line = String::new();
+        for row in &self.rows {
+            let Row::Cells(row) = row else {
+                if let Row::Line(line) = row {
+                    println!("{line}");
+                }
+                continue;
+            };
+            let mut line = " ".repeat(self.indent);
             for (i, cell) in row.iter().enumerate() {
                 line += cell;
                 if i + 1 < row.len() {
@@ -192,8 +225,72 @@ fn method(a: &Artifact) -> String {
     }
 }
 
-pub fn print_list(root: &Path, arts: &[&Artifact]) {
-    let mut t = Table::header(&[
+/// What -group puts each artifact under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    Project,
+    Kind,
+    Safety,
+}
+
+impl Group {
+    fn key(self, root: &Path, a: &Artifact) -> String {
+        match self {
+            Self::Project => rel(root, &a.project),
+            Self::Kind => a.kind.to_owned(),
+            Self::Safety => a.safety.as_str().to_owned(),
+        }
+    }
+}
+
+/// The artifacts under each group, keeping their order within it. Groups follow -sort: the most to free first, A to
+/// Z by path, or the longest unbuilt first. Safety groups keep their own order instead: safe, caution, unsafe.
+pub fn groups<'a>(
+    root: &Path,
+    arts: &[&'a Artifact],
+    by: Group,
+    sort_by: &str,
+) -> Vec<(String, Vec<&'a Artifact>)> {
+    let mut groups: Vec<(String, Vec<&Artifact>)> = Vec::new();
+    for &a in arts {
+        let key = by.key(root, a);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, members)) => members.push(a),
+            None => groups.push((key, vec![a])),
+        }
+    }
+    match sort_by {
+        _ if by == Group::Safety => groups.sort_by_key(|(_, m)| m.first().map(|a| a.safety)),
+        "path" => groups.sort_by(|a, b| a.0.cmp(&b.0)),
+        "age" => groups.sort_by_key(|(_, m)| m.iter().filter_map(|a| a.last_built).min()),
+        _ => {
+            groups
+                .sort_by_key(|(_, m)| std::cmp::Reverse(m.iter().map(|a| a.freed()).sum::<u64>()));
+        }
+    }
+    groups
+}
+
+/// A group's heading: its name, in its safety's color when grouped by safety, then how much is in it.
+pub fn group_heading(by: Group, name: &str, members: &[&Artifact]) -> String {
+    let total: u64 = members.iter().map(|a| a.freed()).sum();
+    let title = match members.first() {
+        Some(a) if by == Group::Safety => bold(&safety_label(a.safety)),
+        _ => bold(name),
+    };
+    format!(
+        "{}  {}",
+        title,
+        dim(&format!(
+            "{}, {}",
+            plural(members.len(), "artifact"),
+            human(total)
+        ))
+    )
+}
+
+pub fn print_list(root: &Path, arts: &[&Artifact], group: Option<Group>, sort_by: &str) {
+    const COLS: [&str; 8] = [
         "SIZE",
         "SAFETY",
         "KIND",
@@ -202,26 +299,59 @@ pub fn print_list(root: &Path, arts: &[&Artifact]) {
         "LAST BUILT",
         "CLEAN WITH",
         "REBUILD WITH",
-    ]);
-    for a in arts {
-        let mut note = a.rebuild.clone();
-        if !a.why.is_empty() {
-            note = format!("{note}  ({})", a.why);
+    ];
+    // A group's heading already says its kind or project: leave that column out.
+    let left_out = match group {
+        Some(Group::Safety) => Some(1),
+        Some(Group::Kind) => Some(2),
+        Some(Group::Project) => Some(3),
+        None => None,
+    };
+    let keep = |cells: Vec<String>| -> Vec<String> {
+        cells
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != left_out)
+            .map(|(_, c)| c)
+            .collect()
+    };
+    let cols: Vec<&str> = COLS
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != left_out)
+        .map(|(_, c)| *c)
+        .collect();
+    let mut t = Table::new(&cols, if group.is_some() { 2 } else { 0 });
+    let rows = |t: &mut Table, arts: &[&Artifact]| {
+        for a in arts {
+            let mut note = a.rebuild.clone();
+            if !a.why.is_empty() {
+                note = format!("{note}  ({})", a.why);
+            }
+            let mut size = human(a.freed());
+            if a.shared > 0 {
+                size += &dim(&format!(" +{} shared", human(a.shared)));
+            }
+            t.row(keep(vec![
+                size,
+                safety_label(a.safety),
+                a.kind.into(),
+                rel(root, &a.project),
+                a.dir.clone(),
+                dim(&ago(a.last_built)),
+                method(a),
+                dim(&note),
+            ]));
         }
-        let mut size = human(a.freed());
-        if a.shared > 0 {
-            size += &dim(&format!(" +{} shared", human(a.shared)));
+    };
+    match group {
+        None => rows(&mut t, arts),
+        Some(by) => {
+            for (name, members) in groups(root, arts, by, sort_by) {
+                t.line(group_heading(by, &name, &members));
+                rows(&mut t, &members);
+            }
         }
-        t.row(vec![
-            size,
-            safety_label(a.safety),
-            a.kind.into(),
-            rel(root, &a.project),
-            a.dir.clone(),
-            dim(&ago(a.last_built)),
-            method(a),
-            dim(&note),
-        ]);
     }
     t.print();
 }
@@ -234,8 +364,8 @@ struct Node<'a> {
     art: Option<&'a Artifact>,
 }
 
-/// The summary line above names the root, so the root gets a line of its own only when there are several.
-pub fn print_tree(root: &Path, arts: &[&Artifact], name_root: bool) {
+/// The artifacts as a tree of the folders under `root`, which the lines above have already named.
+pub fn print_tree(root: &Path, arts: &[&Artifact]) {
     let mut top = Node::default();
     for a in arts {
         let mut n = &mut top;
@@ -245,9 +375,6 @@ pub fn print_tree(root: &Path, arts: &[&Artifact], name_root: bool) {
             n.bytes += a.freed();
         }
         n.art = Some(a);
-    }
-    if name_root {
-        println!("{}  {}", bold(&tilde(root)), human(top.bytes));
     }
     walk_tree(&top, "");
 }
@@ -301,7 +428,7 @@ pub fn print_caches(cs: &mut [Cache]) {
         human(total),
         dim("(refilled on demand; devsweep clean -caches offers each one)")
     );
-    let mut t = Table::header(&["SIZE", "SAFETY", "CACHE", "PATH", "CLEAN WITH"]);
+    let mut t = Table::new(&["SIZE", "SAFETY", "CACHE", "PATH", "CLEAN WITH"], 0);
     for c in cs.iter() {
         let path = if c.path.as_os_str().is_empty() {
             "-".into()

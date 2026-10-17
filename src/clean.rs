@@ -68,11 +68,11 @@ impl Job {
 struct Plan<'a> {
     /// Safe: asked about once, together.
     batch: Vec<Job>,
-    /// Caution, with -include-caution: asked about one by one.
+    /// Caution, with --include-caution: asked about one by one.
     one_by_one: Vec<Job>,
     /// No tool cleans these and -rm wasn't given.
     need_rm: Vec<&'a Artifact>,
-    /// Caution, without -include-caution.
+    /// Caution, without --include-caution.
     caution: Vec<&'a Artifact>,
     /// Tracked in git: never cleaned.
     tracked: Vec<&'a Artifact>,
@@ -144,23 +144,33 @@ fn plan<'a>(root: &Path, arts: &[&'a Artifact], o: &Options) -> Plan<'a> {
     p
 }
 
-/// Runs jobs, or with -dry-run only says what it would run, and keeps the score.
+/// Runs jobs, or with --dry-run only says what it would run, and keeps the score.
 struct Runner {
-    dry_run: bool,
+    dry_run: Option<bool>,
     freed: u64,
+    would_free: u64,
+    /// An rm -rf was left as a dry run only because --dry-run wasn't given.
+    rm_held_back: bool,
     failed: bool,
 }
 
 impl Runner {
+    /// Whether a job only shows what it would do: as --dry-run says, and when it doesn't say, a tool's own command
+    /// runs while an rm -rf, which nothing can undo, stays a dry run.
+    fn dry(&self, j: &Job) -> bool {
+        self.dry_run.unwrap_or(j.argv.is_empty())
+    }
+
     fn run(&mut self, j: &Job) {
-        if self.dry_run {
+        if self.dry(j) {
+            self.rm_held_back |= self.dry_run.is_none();
             let wh = if j.dir.as_os_str().is_empty() || j.argv.is_empty() {
                 String::new()
             } else {
                 format!("{}  ", dim(&format!("(cd {})", tilde(&j.dir))))
             };
             println!("  would run  {wh}{}{}", j.method(), j.rm_target());
-            self.freed += j.before;
+            self.would_free += j.before;
             return;
         }
         if let Err(e) = j.run() {
@@ -184,6 +194,8 @@ pub fn run_clean(roots: &[PathBuf], arts: &[&Artifact], caches: &[Cache], o: &Op
     let mut runner = Runner {
         dry_run: o.dry_run,
         freed: 0,
+        would_free: 0,
+        rm_held_back: false,
         failed: false,
     };
 
@@ -204,7 +216,7 @@ pub fn run_clean(roots: &[PathBuf], arts: &[&Artifact], caches: &[Cache], o: &Op
             );
         }
         let question = format!("\nRun these {} ({})?", p.batch.len(), human(total));
-        if o.dry_run || o.yes || ask(&question) {
+        if o.yes || p.batch.iter().all(|j| runner.dry(j)) || ask(&question) {
             p.batch.iter().for_each(|j| runner.run(j));
         }
     }
@@ -218,7 +230,7 @@ pub fn run_clean(roots: &[PathBuf], arts: &[&Artifact], caches: &[Cache], o: &Op
                 j.label,
                 human(j.before)
             );
-            if o.dry_run || ask(&question) {
+            if runner.dry(j) || ask(&question) {
                 runner.run(j);
             }
         }
@@ -228,8 +240,19 @@ pub fn run_clean(roots: &[PathBuf], arts: &[&Artifact], caches: &[Cache], o: &Op
     }
     report_left_alone(root, &p);
 
-    let verb = if o.dry_run { "Would free" } else { "Freed" };
-    println!("\n{verb} {}", bold(&human(runner.freed)));
+    println!();
+    if runner.freed > 0 || runner.would_free == 0 {
+        println!("Freed {}", bold(&human(runner.freed)));
+    }
+    if runner.would_free > 0 {
+        println!("Would free {}", bold(&human(runner.would_free)));
+    }
+    if runner.rm_held_back {
+        println!(
+            "{}",
+            dim("rm -rf only showed what it would delete; add --dry-run=false to delete for real")
+        );
+    }
     i32::from(runner.failed)
 }
 
@@ -269,7 +292,7 @@ fn clean_caches(caches: &[Cache], o: &Options, runner: &mut Runner) {
             human(c.bytes),
             dim(&format!("via {}", c.method()))
         );
-        if o.dry_run || ask(&question) {
+        if runner.dry(&j) || ask(&question) {
             runner.run(&j);
         }
     }
@@ -291,7 +314,7 @@ fn report_left_alone(root: &Path, p: &Plan<'_>) {
     }
     if !p.caution.is_empty() {
         println!(
-            "\n{}  {} left alone; add -include-caution to be asked about each",
+            "\n{}  {} left alone; add --include-caution to be asked about each",
             paint("33", "Caution"),
             plural(p.caution.len(), "artifact")
         );
