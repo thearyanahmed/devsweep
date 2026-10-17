@@ -4,7 +4,7 @@ What your projects' build output costs in disk space, whether it's safe to remov
 command.
 
 ```sh
-make install                  # go install: puts devsweep in ~/go/bin
+make install                  # cargo install: puts devsweep in ~/.cargo/bin
 devsweep                      # table of everything under ~/dev
 devsweep -tree                # the same as a tree
 devsweep -caches              # plus shared caches: cargo, go, npm, pnpm, brew, docker, ...
@@ -32,5 +32,5 @@ Some things have no tool command (`node_modules`, `.next`, `__pycache__`, `.venv
 `rm -rf` and are left alone unless you pass `-rm`.
 
 A project is recognised by a directory name plus a marker beside it (`target` + `Cargo.toml`, `node_modules` +
-`package.json`, ...): see `rules.go` to add one. Sizes are disk usage; hard links shared with something outside the
+`package.json`, ...): see `src/rules.rs` to add one. Sizes are disk usage; hard links shared with something outside the
 artifact are shown separately as "shared", since deleting doesn't free them.
