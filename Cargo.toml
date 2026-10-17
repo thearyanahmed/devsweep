@@ -13,3 +13,55 @@ serde_json = "1"
 lto = true
 codegen-units = 1
 strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+# Dead code, unused imports/variables/results and friends are errors, not warnings.
+unused = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_qualifications = "deny"
+unused_lifetimes = "deny"
+unused_crate_dependencies = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+let_underscore_drop = "deny"
+redundant_lifetimes = "deny"
+missing_debug_implementations = "deny"
+
+[lints.clippy]
+# Every opinionated group, as errors.
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+# Not published to crates.io: no license, keywords or categories to declare.
+cargo_common_metadata = "allow"
+
+# Chosen from the restriction group.
+allow_attributes = "deny"                 # #[expect] instead: it fails once the lint no longer fires
+allow_attributes_without_reason = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"                      # .expect("why this can't fail") instead
+get_unwrap = "deny"
+string_slice = "deny"                     # byte-index slicing can split a character
+str_to_string = "deny"
+unneeded_field_pattern = "deny"
+rest_pat_in_fully_bound_structs = "deny"
+redundant_type_annotations = "deny"
+if_then_some_else_none = "deny"
+multiple_inherent_impl = "deny"
+semicolon_inside_block = "deny"
+let_underscore_must_use = "deny"
+let_underscore_untyped = "deny"
+lossy_float_literal = "deny"
+verbose_file_reads = "deny"
+needless_raw_strings = "deny"
+renamed_function_params = "deny"
+same_name_method = "deny"
+tests_outside_test_module = "deny"
+unused_result_ok = "deny"
+unused_trait_names = "deny"
+empty_structs_with_brackets = "deny"
+format_push_string = "deny"

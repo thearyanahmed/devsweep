@@ -11,7 +11,7 @@ use crate::rules::{Safety, exists};
 use crate::scan::measure_all;
 
 /// A shared, tool-wide cache outside any project.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct Cache {
     pub name: &'static str,
     pub path: PathBuf,
@@ -29,10 +29,15 @@ pub struct Cache {
 
 impl Cache {
     pub fn method(&self) -> String {
-        match &self.cmd {
-            Some(argv) => argv.join(" "),
-            None => format!("rm -rf {}", tilde(&self.path)),
-        }
+        self.cmd.as_ref().map_or_else(
+            || format!("rm -rf {}", tilde(&self.path)),
+            |argv| argv.join(" "),
+        )
+    }
+
+    const fn note(mut self, note: &'static str) -> Self {
+        self.note = note;
+        self
     }
 }
 
@@ -41,17 +46,10 @@ fn cache(name: &'static str, path: PathBuf, cmd: &[&str]) -> Cache {
         name,
         path,
         bytes: 0,
-        cmd: (!cmd.is_empty()).then(|| cmd.iter().map(|s| s.to_string()).collect()),
+        cmd: (!cmd.is_empty()).then(|| cmd.iter().map(ToString::to_string).collect()),
         safety: Safety::Safe,
         note: "",
         docker: false,
-    }
-}
-
-impl Cache {
-    fn note(mut self, note: &'static str) -> Self {
-        self.note = note;
-        self
     }
 }
 
@@ -64,7 +62,7 @@ pub fn caches() -> Vec<Cache> {
     let (go, pnpm) = thread::scope(|s| {
         let pnpm = s.spawn(|| pnpm_store(h("Library/pnpm/store")));
         let go = output("go", &["env", "GOCACHE", "GOMODCACHE"]).unwrap_or_default();
-        (go, pnpm.join().unwrap())
+        (go, pnpm.join().expect("the pnpm thread panicked"))
     });
     let mut go = go.lines().map(PathBuf::from);
     let gocache = go
@@ -123,14 +121,13 @@ pub fn caches() -> Vec<Cache> {
         .filter(|c| !c.docker)
         .map(|c| c.path.as_path())
         .collect();
-    let mut sizes = measure_all(&paths).into_iter();
+    let sizes = measure_all(&paths);
+    for (c, m) in list.iter_mut().filter(|c| !c.docker).zip(sizes) {
+        c.bytes = m.bytes;
+    }
     let docker = docker.map_or(0, |d| d.join().unwrap_or(0));
-    for c in &mut list {
-        c.bytes = if c.docker {
-            docker
-        } else {
-            sizes.next().unwrap().bytes
-        };
+    for c in list.iter_mut().filter(|c| c.docker) {
+        c.bytes = docker;
     }
     // Docker not running, or nothing to reclaim: leave it out.
     list.retain(|c| c.bytes != 0);
@@ -143,7 +140,7 @@ fn output(cmd: &str, args: &[&str]) -> Option<String> {
         .stderr(Stdio::null())
         .output()
         .ok()?;
-    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_owned();
     (out.status.success() && !s.is_empty()).then_some(s)
 }
 
@@ -157,11 +154,12 @@ fn pnpm_store(default: PathBuf) -> PathBuf {
 /// What `docker system df` says could be reclaimed; 0 when Docker isn't running.
 fn docker_reclaimable() -> u64 {
     let (tx, rx) = mpsc::channel();
+    // Nobody may be listening by the time it answers; then the send just fails.
     thread::spawn(move || {
-        let _ = tx.send(output(
+        tx.send(output(
             "docker",
             &["system", "df", "--format", "{{.Reclaimable}}"],
-        ));
+        ))
     });
     // A stopped Docker Desktop can hang the CLI; don't wait on it.
     let Ok(Some(out)) = rx.recv_timeout(Duration::from_secs(5)) else {
@@ -171,10 +169,17 @@ fn docker_reclaimable() -> u64 {
 }
 
 /// Parses the leading size of a line like "1.2GB (40%)", in Docker's decimal units.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "parsed from digits only, so never negative"
+)]
 fn docker_size(s: &str) -> Option<u64> {
-    let end = s.find(|c: char| !c.is_ascii_digit() && c != '.')?;
-    let v: f64 = s[..end].parse().ok()?;
-    let unit = s[end..]
+    let number = |c: char| c.is_ascii_digit() || c == '.';
+    let digits: String = s.chars().take_while(|&c| number(c)).collect();
+    let v: f64 = digits.parse().ok()?;
+    let unit = s
+        .trim_start_matches(number)
         .trim_start()
         .split(|c: char| !c.is_ascii_alphabetic())
         .next()?;
@@ -191,7 +196,7 @@ fn docker_size(s: &str) -> Option<u64> {
 
 /// Whether `cmd` is an executable on PATH.
 pub fn on_path(cmd: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt as _;
     std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|d| {
             std::fs::metadata(d.join(cmd))

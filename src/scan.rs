@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,16 +38,15 @@ pub struct Artifact {
 
 impl Artifact {
     /// What deleting the artifact gives back.
-    pub fn freed(&self) -> u64 {
+    pub const fn freed(&self) -> u64 {
         self.bytes - self.shared
     }
 
     /// How clean removes the artifact, for display.
     pub fn method(&self) -> String {
-        match &self.clean {
-            Some(argv) => argv.join(" "),
-            None => format!("rm -rf {}", self.dir),
-        }
+        self.clean
+            .as_ref()
+            .map_or_else(|| format!("rm -rf {}", self.dir), |argv| argv.join(" "))
     }
 }
 
@@ -62,7 +61,8 @@ pub fn scan(roots: &[PathBuf]) -> Vec<Artifact> {
     let paths: Vec<&Path> = found.iter().map(|a| a.path.as_path()).collect();
     let (measures, verdicts) = thread::scope(|s| {
         let git = s.spawn(|| parallel_map(&found, git_verdict));
-        (measure_all(&paths), git.join().unwrap())
+        let measures = measure_all(&paths);
+        (measures, git.join().expect("the git thread panicked"))
     });
     for ((a, m), verdict) in found.iter_mut().zip(measures).zip(verdicts) {
         (a.bytes, a.shared, a.files, a.last_built) = (m.bytes, m.shared, m.files, m.last_built);
@@ -75,27 +75,34 @@ pub fn scan(roots: &[PathBuf]) -> Vec<Artifact> {
 }
 
 fn workers() -> usize {
-    thread::available_parallelism().map_or(4, |n| n.get())
+    thread::available_parallelism().map_or(4, std::num::NonZero::get)
 }
 
 /// `f` over every item, on all cores, keeping the order.
 fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let next = AtomicUsize::new(0);
-    let out: Vec<Mutex<Option<R>>> = items.iter().map(|_| Mutex::new(None)).collect();
-    thread::scope(|s| {
-        for _ in 0..workers().min(items.len()) {
-            s.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(item) = items.get(i) else { break };
-                    *out[i].lock().unwrap() = Some(f(item));
-                }
-            });
-        }
+    let mut done: Vec<(usize, R)> = thread::scope(|s| {
+        let handles: Vec<_> = (0..workers().min(items.len()))
+            .map(|_| {
+                s.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(i) else {
+                            return mine;
+                        };
+                        mine.push((i, f(item)));
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("a worker thread panicked"))
+            .collect()
     });
-    out.into_iter()
-        .map(|m| m.into_inner().unwrap().unwrap())
-        .collect()
+    done.sort_unstable_by_key(|&(i, _)| i);
+    done.into_iter().map(|(_, r)| r).collect()
 }
 
 /// Walks `dir` in name order, collecting artifacts without descending into them.
@@ -104,7 +111,7 @@ fn find(dir: &Path, found: &mut Vec<Artifact>) {
         return; // unreadable: skip, don't abort the scan
     };
     let mut entries: Vec<_> = entries.flatten().collect();
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by_key(fs::DirEntry::file_name);
     for e in entries {
         if !e.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
@@ -150,14 +157,21 @@ pub fn measure(root: &Path) -> Measure {
     measure_all(&[root]).pop().unwrap_or_default()
 }
 
+/// A hard-linked file, counted once however many of its links a walk meets.
+#[derive(Debug, Clone, Copy)]
+struct Link {
+    size: u64,
+    nlink: u64,
+    seen: u64,
+}
+
 /// What one worker saw of one tree. Hard-linked files are kept aside by inode, so the merge can count each once.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Partial {
     bytes: u64,
     files: u64,
     last_built: Option<SystemTime>,
-    /// inode -> (size, link count, links seen)
-    links: HashMap<u64, (u64, u64, u64)>,
+    links: HashMap<u64, Link>,
 }
 
 impl Partial {
@@ -171,10 +185,15 @@ impl Partial {
         if md.is_dir() {
             self.bytes += size;
         } else if md.nlink() > 1 {
+            let nlink = md.nlink();
             self.links
                 .entry(md.ino())
-                .or_insert((size, md.nlink(), 0))
-                .2 += 1;
+                .or_insert(Link {
+                    size,
+                    nlink,
+                    seen: 0,
+                })
+                .seen += 1;
         } else {
             self.bytes += size;
             self.files += 1;
@@ -182,94 +201,141 @@ impl Partial {
     }
 }
 
-/// Measures several trees at once with one pool of threads sharing a queue of directories, so a single huge tree
-/// (node_modules) is spread over every core too. A hard-linked file counts once, and counts as shared only when some
-/// of its links live outside its tree (deleting the tree doesn't free it then).
-pub fn measure_all(roots: &[&Path]) -> Vec<Measure> {
-    // The queue holds (tree, directory, is the tree's root) and how many directories are queued or being read.
-    let queue = Mutex::new((
-        roots
+/// A directory waiting to be read, and which tree it belongs to.
+#[derive(Debug)]
+struct Pending {
+    tree: usize,
+    dir: PathBuf,
+    /// The tree's own root, which nothing has looked at yet.
+    is_root: bool,
+}
+
+/// The directories still to read, shared by the workers.
+#[derive(Debug)]
+struct DirQueue {
+    state: Mutex<QueueState>,
+    wake: Condvar,
+}
+
+#[derive(Debug)]
+struct QueueState {
+    waiting: Vec<Pending>,
+    /// Directories waiting or being read: the walk is over when this reaches 0.
+    open: usize,
+}
+
+impl DirQueue {
+    fn new(roots: &[&Path]) -> Self {
+        let waiting: Vec<Pending> = roots
             .iter()
             .enumerate()
-            .map(|(i, p)| (i, p.to_path_buf(), true))
-            .collect::<Vec<_>>(),
-        roots.len(),
-    ));
-    let wake = Condvar::new();
-    let partials: Vec<Vec<Partial>> = thread::scope(|s| {
-        let handles: Vec<_> = (0..workers())
-            .map(|_| {
-                s.spawn(|| {
-                    let mut mine: Vec<Partial> = roots.iter().map(|_| Partial::default()).collect();
-                    loop {
-                        let next = {
-                            let mut q = queue.lock().unwrap();
-                            loop {
-                                if let Some(item) = q.0.pop() {
-                                    break Some(item);
-                                }
-                                if q.1 == 0 {
-                                    break None;
-                                }
-                                q = wake.wait(q).unwrap();
-                            }
-                        };
-                        let Some((i, dir, is_root)) = next else {
-                            return mine;
-                        };
-                        let mut subdirs = Vec::new();
-                        let read = !is_root
-                            || fs::symlink_metadata(&dir).is_ok_and(|md| {
-                                mine[i].add(&md);
-                                md.is_dir()
-                            });
-                        if read && let Ok(entries) = fs::read_dir(&dir) {
-                            for e in entries.flatten() {
-                                // DirEntry::metadata doesn't follow symlinks, and is cheaper than a stat by path.
-                                let Ok(md) = e.metadata() else { continue };
-                                mine[i].add(&md);
-                                if md.is_dir() {
-                                    subdirs.push((i, e.path(), false));
-                                }
-                            }
-                        }
-                        let mut q = queue.lock().unwrap();
-                        q.1 += subdirs.len();
-                        q.1 -= 1;
-                        let more = !subdirs.is_empty();
-                        q.0.extend(subdirs);
-                        if more || q.1 == 0 {
-                            wake.notify_all();
-                        }
-                    }
-                })
+            .map(|(tree, p)| Pending {
+                tree,
+                dir: p.to_path_buf(),
+                is_root: true,
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+        let open = waiting.len();
+        Self {
+            state: Mutex::new(QueueState { waiting, open }),
+            wake: Condvar::new(),
+        }
+    }
 
+    /// The next directory to read, waiting while others are being read; `None` once the walk is over.
+    fn take(&self) -> Option<Pending> {
+        let mut q = self.state.lock().expect("a measuring thread panicked");
+        loop {
+            if let Some(p) = q.waiting.pop() {
+                return Some(p);
+            }
+            if q.open == 0 {
+                return None;
+            }
+            q = self.wake.wait(q).expect("a measuring thread panicked");
+        }
+    }
+
+    /// Marks a directory read, queueing the subdirectories found in it.
+    fn finish(&self, subdirs: Vec<Pending>) {
+        let mut q = self.state.lock().expect("a measuring thread panicked");
+        q.open = q.open + subdirs.len() - 1;
+        let more = !subdirs.is_empty();
+        q.waiting.extend(subdirs);
+        if more || q.open == 0 {
+            self.wake.notify_all();
+        }
+    }
+}
+
+/// Measures several trees at once with one pool of threads sharing a queue of directories, so a single huge tree
+/// (`node_modules`) is spread over every core too. A hard-linked file counts once, and counts as shared only when some
+/// of its links live outside its tree (deleting the tree doesn't free it then).
+pub fn measure_all(roots: &[&Path]) -> Vec<Measure> {
+    let queue = DirQueue::new(roots);
+    let partials: Vec<Vec<Partial>> = thread::scope(|s| {
+        let handles: Vec<_> = (0..workers())
+            .map(|_| s.spawn(|| walk(&queue, roots.len())))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("a measuring thread panicked"))
+            .collect()
+    });
     (0..roots.len())
-        .map(|i| {
-            let mut m = Measure::default();
-            let mut links: HashMap<u64, (u64, u64, u64)> = HashMap::new();
-            for p in partials.iter().map(|w| &w[i]) {
-                m.bytes += p.bytes;
-                m.files += p.files;
-                m.last_built = m.last_built.max(p.last_built);
-                for (&ino, &(size, nlink, seen)) in &p.links {
-                    links.entry(ino).or_insert((size, nlink, 0)).2 += seen;
-                }
-            }
-            for (size, nlink, seen) in links.into_values() {
-                m.bytes += size;
-                m.files += 1;
-                if seen < nlink {
-                    m.shared += size;
-                }
-            }
-            m
-        })
+        .map(|tree| merge(&partials, tree))
         .collect()
+}
+
+/// One worker: reads directories off the queue until the walk is over, tallying what it sees per tree.
+fn walk(queue: &DirQueue, trees: usize) -> Vec<Partial> {
+    let mut mine: Vec<Partial> = (0..trees).map(|_| Partial::default()).collect();
+    while let Some(Pending { tree, dir, is_root }) = queue.take() {
+        let mut subdirs = Vec::new();
+        let read = !is_root
+            || fs::symlink_metadata(&dir).is_ok_and(|md| {
+                mine[tree].add(&md);
+                md.is_dir()
+            });
+        if read && let Ok(entries) = fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                // DirEntry::metadata doesn't follow symlinks, and is cheaper than a stat by path.
+                let Ok(md) = e.metadata() else { continue };
+                mine[tree].add(&md);
+                if md.is_dir() {
+                    subdirs.push(Pending {
+                        tree,
+                        dir: e.path(),
+                        is_root: false,
+                    });
+                }
+            }
+        }
+        queue.finish(subdirs);
+    }
+    mine
+}
+
+/// One tree's total from every worker's part of it.
+fn merge(partials: &[Vec<Partial>], tree: usize) -> Measure {
+    let mut m = Measure::default();
+    let mut links: HashMap<u64, Link> = HashMap::new();
+    for p in partials.iter().map(|w| &w[tree]) {
+        m.bytes += p.bytes;
+        m.files += p.files;
+        m.last_built = m.last_built.max(p.last_built);
+        for (&ino, &link) in &p.links {
+            links.entry(ino).or_insert(Link { seen: 0, ..link }).seen += link.seen;
+        }
+    }
+    for link in links.into_values() {
+        m.bytes += link.size;
+        m.files += 1;
+        if link.seen < link.nlink {
+            m.shared += link.size;
+        }
+    }
+    m
 }
 
 /// Whether git changes an artifact's safety: unsafe when git tracks files in it, caution when it isn't gitignored.
@@ -285,6 +351,7 @@ fn git_verdict(a: &Artifact) -> Option<(Safety, String)> {
         .output()
         .ok()
         .filter(|o| o.status.success())?;
+    #[expect(clippy::naive_bytecount, reason = "one count over a short git listing")]
     let tracked = out.stdout.iter().filter(|&&b| b == b'\n').count();
     if tracked > 0 {
         return Some((
@@ -309,13 +376,17 @@ fn join(a: &str, b: &str) -> String {
     }
 }
 
-/// RFC 3339 in UTC, with the fraction trimmed the way Go's RFC3339Nano does.
+/// RFC 3339 in UTC, with the fraction trimmed the way Go's `RFC3339Nano` does.
+#[expect(
+    clippy::ref_option,
+    reason = "serde's serialize_with passes the field by reference"
+)]
 fn rfc3339<S: Serializer>(t: &Option<SystemTime>, s: S) -> Result<S::Ok, S::Error> {
     let Some(t) = t else {
         return s.serialize_none();
     };
     let d = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
-    let secs = d.as_secs() as i64;
+    let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
     let z = days + 719_468;
@@ -349,7 +420,9 @@ mod tests {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            if let Err(e) = fs::remove_dir_all(&self.0) {
+                eprintln!("couldn't remove {}: {e}", self.0.display());
+            }
         }
     }
 
@@ -411,10 +484,10 @@ mod tests {
             })
             .collect();
         let want = HashMap::from([
-            ("rs/target".to_string(), Safety::Safe),
-            ("web/node_modules".to_string(), Safety::Caution),
-            ("web/dist".to_string(), Safety::Unsafe),
-            ("loose/node_modules".to_string(), Safety::Caution),
+            ("rs/target".to_owned(), Safety::Safe),
+            ("web/node_modules".to_owned(), Safety::Caution),
+            ("web/dist".to_owned(), Safety::Unsafe),
+            ("loose/node_modules".to_owned(), Safety::Caution),
         ]);
         assert_eq!(got, want);
     }

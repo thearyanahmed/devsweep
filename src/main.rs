@@ -1,4 +1,4 @@
-//! devsweep finds the build output projects leave behind (target/, node_modules/, .venv/, ...), says how big each one
+//! devsweep finds the build output projects leave behind (target/, `node_modules`/, .venv/, ...), says how big each one
 //! is and whether deleting it is safe, and cleans it on request.
 
 mod caches;
@@ -99,6 +99,11 @@ const FLAGS: &[Flag] = &[
     flag("yes", "clean: don't ask before deleting safe artifacts"),
 ];
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one bool per command-line switch"
+)]
+#[derive(Debug)]
 pub struct Options {
     pub tree: bool,
     pub json: bool,
@@ -157,7 +162,7 @@ fn parse_args(args: &[String]) -> (BTreeMap<&'static str, String>, Vec<String>) 
             continue;
         };
         let (name, value) = match body.split_once('=') {
-            Some((n, v)) => (n, Some(v.to_string())),
+            Some((n, v)) => (n, Some(v.to_owned())),
             None => (body, None),
         };
         if name == "h" || name == "help" {
@@ -168,7 +173,7 @@ fn parse_args(args: &[String]) -> (BTreeMap<&'static str, String>, Vec<String>) 
             usage();
         };
         let value = match (f.kind.is_empty(), value) {
-            (true, None) => "true".to_string(),
+            (true, None) => "true".to_owned(),
             (true, Some(v)) if matches!(v.as_str(), "true" | "false" | "1" | "0") => v,
             (true, Some(v)) => fail(format!("invalid boolean value {v:?} for -{name}")),
             (false, Some(v)) => v,
@@ -182,28 +187,25 @@ fn parse_args(args: &[String]) -> (BTreeMap<&'static str, String>, Vec<String>) 
     (set, dirs)
 }
 
-fn main() {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let clean = args.first().is_some_and(|a| a == "clean");
-    if clean {
-        args.remove(0);
-    }
-    let (set, dirs) = parse_args(&args);
+/// A string flag's default value.
+fn default_of(name: &str) -> &'static str {
+    FLAGS
+        .iter()
+        .find(|f| f.name == name)
+        .map_or("", |f| f.default)
+}
+
+/// The options from the flags given, with defaults for the rest.
+fn options(set: &BTreeMap<&'static str, String>) -> Options {
     let on = |name| set.get(name).is_some_and(|v| v == "true" || v == "1");
     let get = |name: &str| {
-        set.get(name).cloned().unwrap_or_else(|| {
-            FLAGS
-                .iter()
-                .find(|f| f.name == name)
-                .unwrap()
-                .default
-                .into()
-        })
+        set.get(name)
+            .cloned()
+            .unwrap_or_else(|| default_of(name).into())
     };
-
     let older = get("older");
     let kinds = get("kind");
-    let o = Options {
+    Options {
         tree: on("tree"),
         json: on("json"),
         caches: on("caches"),
@@ -213,22 +215,23 @@ fn main() {
         rm: on("rm"),
         older: (!older.is_empty()).then(|| parse_age(&older).unwrap_or_else(|e| fail(e))),
         min: parse_size(&get("min")).unwrap_or_else(|e| fail(e)),
-        kinds: (!kinds.is_empty())
-            .then(|| kinds.split(',').map(|k| k.trim().to_string()).collect()),
+        kinds: (!kinds.is_empty()).then(|| kinds.split(',').map(|k| k.trim().to_owned()).collect()),
         sort_by: get("sort"),
         raw: ["older", "kind", "min"]
             .into_iter()
             .map(|n| (n, get(n)))
             .collect(),
-    };
+    }
+}
 
+/// The dirs to scan as absolute paths, ~/dev when none are given; exits if one isn't a directory.
+fn resolve_roots(dirs: &[String]) -> Vec<PathBuf> {
     let dirs = if dirs.is_empty() {
         vec![Path::new(&std::env::var_os("HOME").unwrap_or_default()).join("dev")]
     } else {
         dirs.iter().map(PathBuf::from).collect()
     };
-    let roots: Vec<PathBuf> = dirs
-        .iter()
+    dirs.iter()
         .map(|d| {
             let abs = normalize(&std::path::absolute(d).unwrap_or_else(|e| fail(e)));
             if !abs.is_dir() {
@@ -236,17 +239,28 @@ fn main() {
             }
             abs
         })
-        .collect();
+        .collect()
+}
+
+fn main() {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let clean = args.first().is_some_and(|a| a == "clean");
+    if clean {
+        args.remove(0);
+    }
+    let (set, dirs) = parse_args(&args);
+    let o = options(&set);
+    let roots = resolve_roots(&dirs);
 
     // The shared caches don't depend on the projects: measure them at the same time.
     let pending_caches = o.caches.then(|| std::thread::spawn(caches::caches));
-    let caches = move || pending_caches.map(|t| t.join().unwrap());
+    let caches = move || pending_caches.map(|t| t.join().expect("the cache thread panicked"));
     let all = scan::scan(&roots);
-    let arts = filter(&all, &o);
+    let shown = filter(&all, &o);
 
     if clean {
         let caches = caches().unwrap_or_default();
-        process::exit(clean::run_clean(&roots, &arts, &caches, &o));
+        process::exit(clean::run_clean(&roots, &shown, &caches, &o));
     }
 
     if o.json {
@@ -259,25 +273,28 @@ fn main() {
             roots: &'a [PathBuf],
         }
         let out = Out {
-            artifacts: &arts,
+            artifacts: &shown,
             caches: caches(),
             roots: &roots,
         };
-        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).expect("paths and strings always serialize")
+        );
         return;
     }
 
-    summary(&roots, &arts);
+    summary(&roots, &shown);
     println!();
     if all.is_empty() {
         println!("{}", dim("nothing found"));
     }
-    let hidden = all.len() - arts.len();
+    let hidden = all.len() - shown.len();
     if hidden > 0 {
-        println!("{}\n", dim(&hidden_note(&all, &arts, hidden, &o)));
+        println!("{}\n", dim(&hidden_note(&all, &shown, hidden, &o)));
     }
     for root in &roots {
-        let under: Vec<&Artifact> = arts
+        let under: Vec<&Artifact> = shown
             .iter()
             .copied()
             .filter(|a| a.path.starts_with(root) && a.path != *root)
@@ -286,9 +303,9 @@ fn main() {
             continue;
         }
         if o.tree {
-            print_tree(root, &under)
+            print_tree(root, &under);
         } else {
-            print_list(root, &under)
+            print_list(root, &under);
         }
     }
     if o.caches {
@@ -298,7 +315,7 @@ fn main() {
 
 fn filter<'a>(all: &'a [Artifact], o: &Options) -> Vec<&'a Artifact> {
     let now = SystemTime::now();
-    let mut arts: Vec<&Artifact> = all
+    let mut shown: Vec<&Artifact> = all
         .iter()
         .filter(|a| a.bytes >= o.min)
         .filter(|a| {
@@ -310,11 +327,11 @@ fn filter<'a>(all: &'a [Artifact], o: &Options) -> Vec<&'a Artifact> {
         .filter(|a| o.kinds.as_ref().is_none_or(|k| k.contains(a.kind)))
         .collect();
     match o.sort_by.as_str() {
-        "age" => arts.sort_by_key(|a| a.last_built),
-        "path" => arts.sort_by(|a, b| a.path.cmp(&b.path)),
-        _ => arts.sort_by_key(|a| std::cmp::Reverse(a.freed())),
+        "age" => shown.sort_by_key(|a| a.last_built),
+        "path" => shown.sort_by(|a, b| a.path.cmp(&b.path)),
+        _ => shown.sort_by_key(|a| std::cmp::Reverse(a.freed())),
     }
-    arts
+    shown
 }
 
 /// How many artifacts the filters left out and why, so an empty result isn't a mystery.
@@ -326,7 +343,7 @@ fn hidden_note(all: &[Artifact], shown: &[&Artifact], hidden: usize, o: &Options
     let newest = left_out.filter_map(|a| a.last_built).max();
     let mut why: Vec<String> = ["older", "kind", "min"]
         .into_iter()
-        .filter(|n| o.raw[n] != FLAGS.iter().find(|f| f.name == *n).unwrap().default)
+        .filter(|n| o.raw[n] != default_of(n))
         .map(|n| format!("-{n} {}", o.raw[n]))
         .collect();
     if why.is_empty() {
@@ -378,14 +395,21 @@ fn parse_age(s: &str) -> Result<Duration, String> {
     Err(format!("bad -older {s:?}: use e.g. 12h, 14d, 3w, 2mo, 1y"))
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "the value is checked non-negative, and a fraction of a byte doesn't matter"
+)]
 fn parse_size(s: &str) -> Result<u64, String> {
     let upper = s.to_uppercase();
     let s = upper.strip_suffix('B').unwrap_or(&upper);
     let s = s.strip_suffix('I').unwrap_or(s);
-    let (num, mult) = match "KMGT".find(s.chars().last().unwrap_or(' ')) {
-        Some(i) => (&s[..s.len() - 1], 1u64 << (10 * (i + 1))),
-        None => (s, 1),
-    };
+    let (num, mult) = ["K", "M", "G", "T"]
+        .iter()
+        .zip(1..)
+        .find_map(|(unit, power)| Some((s.strip_suffix(unit)?, 1u64 << (10 * power))))
+        .unwrap_or((s, 1));
     match num.parse::<f64>() {
         Ok(v) if v >= 0.0 => Ok((v * mult as f64) as u64),
         _ => Err("bad -min: use e.g. 500K, 100M, 1G".into()),
@@ -398,9 +422,9 @@ mod tests {
 
     #[test]
     fn parses_ages_and_sizes() {
-        assert_eq!(parse_age("2w").unwrap(), Duration::from_secs(14 * 86_400));
-        assert_eq!(parse_age("1mo").unwrap(), Duration::from_secs(30 * 86_400));
-        assert_eq!(parse_age("12h").unwrap(), Duration::from_secs(12 * 3600));
+        assert_eq!(parse_age("2w").unwrap(), Duration::from_hours(336));
+        assert_eq!(parse_age("1mo").unwrap(), Duration::from_hours(720));
+        assert_eq!(parse_age("12h").unwrap(), Duration::from_hours(12));
         assert!(parse_age("5m").is_err());
         assert_eq!(parse_size("100M").unwrap(), 100 << 20);
         assert_eq!(parse_size("1GiB").unwrap(), 1 << 30);

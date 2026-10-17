@@ -16,11 +16,11 @@ pub enum Safety {
 }
 
 impl Safety {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Safety::Safe => "safe",
-            Safety::Caution => "caution",
-            Safety::Unsafe => "unsafe",
+            Self::Safe => "safe",
+            Self::Caution => "caution",
+            Self::Unsafe => "unsafe",
         }
     }
 }
@@ -190,9 +190,11 @@ pub fn find(path: &Path, parent: &Path, name: &str) -> Option<&'static Rule> {
     RULES.iter().find(|r| {
         r.dir == name
             && (r.markers.is_empty()
-                || r.markers.iter().any(|m| match m.strip_prefix('@') {
-                    Some(inside) => exists(&path.join(inside)),
-                    None => exists(&parent.join(m)),
+                || r.markers.iter().any(|m| {
+                    exists(
+                        &m.strip_prefix('@')
+                            .map_or_else(|| parent.join(m), |inside| path.join(inside)),
+                    )
                 }))
     })
 }
@@ -202,14 +204,16 @@ impl Rebuild {
     pub fn resolve(self, parent: &Path) -> (String, Safety, String) {
         match self {
             Fixed(cmd) => (cmd.into(), Safety::Safe, String::new()),
-            NodeInstall => match node_lock(parent) {
-                Some(l) => (l.install.into(), Safety::Safe, String::new()),
-                None => (
-                    "npm install".into(),
-                    Safety::Caution,
-                    "no lockfile: a reinstall may pick newer versions".into(),
-                ),
-            },
+            NodeInstall => node_lock(parent).map_or_else(
+                || {
+                    (
+                        "npm install".into(),
+                        Safety::Caution,
+                        "no lockfile: a reinstall may pick newer versions".into(),
+                    )
+                },
+                |l| (l.install.into(), Safety::Safe, String::new()),
+            ),
             PythonEnv => {
                 const LOCKS: &[(&str, &str)] = &[
                     ("uv.lock", "uv sync"),
@@ -238,10 +242,10 @@ impl Rebuild {
 impl Clean {
     pub fn resolve(self, parent: &Path, dir: &str) -> Option<Vec<String>> {
         match self {
-            Clean::None => None,
-            Clean::Tool(argv) => Some(argv.iter().map(|s| s.to_string()).collect()),
-            Clean::Script => clean_script(parent),
-            Clean::Cmake => Some(
+            Self::None => None,
+            Self::Tool(argv) => Some(argv.iter().map(ToString::to_string).collect()),
+            Self::Script => clean_script(parent),
+            Self::Cmake => Some(
                 ["cmake", "--build", dir, "--target", "clean"]
                     .map(String::from)
                     .to_vec(),

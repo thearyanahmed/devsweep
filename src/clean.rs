@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -63,96 +63,139 @@ impl Job {
     }
 }
 
-pub fn run_clean(roots: &[PathBuf], arts: &[&Artifact], caches: &[Cache], o: &Options) -> i32 {
-    let root = &roots[0];
-    let (mut batch, mut one_by_one) = (Vec::new(), Vec::new());
-    let (mut need_rm, mut caution, mut unsafe_) = (Vec::new(), Vec::new(), Vec::new());
+/// What clean will do with the artifacts it was given.
+#[derive(Default)]
+struct Plan<'a> {
+    /// Safe: asked about once, together.
+    batch: Vec<Job>,
+    /// Caution, with -include-caution: asked about one by one.
+    one_by_one: Vec<Job>,
+    /// No tool cleans these and -rm wasn't given.
+    need_rm: Vec<&'a Artifact>,
+    /// Caution, without -include-caution.
+    caution: Vec<&'a Artifact>,
+    /// Tracked in git: never cleaned.
+    tracked: Vec<&'a Artifact>,
+}
 
+/// A clean command and the project it runs in.
+type CmdKey = (PathBuf, Vec<String>);
+
+/// Where a job sits in the plan.
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    in_batch: bool,
+    index: usize,
+}
+
+fn plan<'a>(root: &Path, arts: &[&'a Artifact], o: &Options) -> Plan<'a> {
+    let mut p = Plan::default();
     // Several artifacts of one project can share a command (cargo clean in a workspace): run it once.
-    let mut by_cmd: HashMap<(PathBuf, Vec<String>), (bool, usize)> = HashMap::new();
-    let mut add =
-        |a: &Artifact, to_batch: bool, batch: &mut Vec<Job>, one_by_one: &mut Vec<Job>| {
-            let list = if to_batch {
-                &mut *batch
-            } else {
-                &mut *one_by_one
-            };
-            let Some(argv) = &a.clean else {
-                list.push(Job {
-                    label: rel(root, &a.path),
-                    dir: a.project.clone(),
-                    argv: vec![],
-                    paths: vec![a.path.clone()],
-                    before: a.bytes,
-                });
-                return;
-            };
-            let key = (a.project.clone(), argv.clone());
-            if let Some(&(in_batch, i)) = by_cmd.get(&key) {
-                let j = if in_batch {
-                    &mut batch[i]
-                } else {
-                    &mut one_by_one[i]
-                };
-                j.paths.push(a.path.clone());
-                j.before += a.bytes;
-                return;
-            }
-            by_cmd.insert(key, (to_batch, list.len()));
-            list.push(Job {
-                label: rel(root, &a.path),
-                dir: a.project.clone(),
-                argv: argv.clone(),
-                paths: vec![a.path.clone()],
-                before: a.bytes,
-            });
-        };
+    let mut by_cmd: HashMap<CmdKey, Slot> = HashMap::new();
     for &a in arts {
-        match a.safety {
-            Safety::Unsafe => unsafe_.push(a),
-            _ if a.clean.is_none() && !o.rm => need_rm.push(a),
-            Safety::Caution if !o.caution => caution.push(a),
-            Safety::Caution => add(a, false, &mut batch, &mut one_by_one),
-            Safety::Safe => add(a, true, &mut batch, &mut one_by_one),
-        }
-    }
-
-    let mut freed = 0u64;
-    let mut failed = 0;
-    let mut run = |j: &Job| {
-        if o.dry_run {
-            let mut wh = String::new();
-            if !j.dir.as_os_str().is_empty() && !j.argv.is_empty() {
-                wh = format!("{}  ", dim(&format!("(cd {})", tilde(&j.dir))));
+        let to_batch = match a.safety {
+            Safety::Unsafe => {
+                p.tracked.push(a);
+                continue;
             }
+            _ if a.clean.is_none() && !o.rm => {
+                p.need_rm.push(a);
+                continue;
+            }
+            Safety::Caution if !o.caution => {
+                p.caution.push(a);
+                continue;
+            }
+            Safety::Caution => false,
+            Safety::Safe => true,
+        };
+        if let Some(argv) = &a.clean
+            && let Some(&Slot { in_batch, index }) = by_cmd.get(&(a.project.clone(), argv.clone()))
+        {
+            let j = if in_batch {
+                &mut p.batch[index]
+            } else {
+                &mut p.one_by_one[index]
+            };
+            j.paths.push(a.path.clone());
+            j.before += a.bytes;
+            continue;
+        }
+        let list = if to_batch {
+            &mut p.batch
+        } else {
+            &mut p.one_by_one
+        };
+        if let Some(argv) = &a.clean {
+            let slot = Slot {
+                in_batch: to_batch,
+                index: list.len(),
+            };
+            by_cmd.insert((a.project.clone(), argv.clone()), slot);
+        }
+        list.push(Job {
+            label: rel(root, &a.path),
+            dir: a.project.clone(),
+            argv: a.clean.clone().unwrap_or_default(),
+            paths: vec![a.path.clone()],
+            before: a.bytes,
+        });
+    }
+    p
+}
+
+/// Runs jobs, or with -dry-run only says what it would run, and keeps the score.
+struct Runner {
+    dry_run: bool,
+    freed: u64,
+    failed: bool,
+}
+
+impl Runner {
+    fn run(&mut self, j: &Job) {
+        if self.dry_run {
+            let wh = if j.dir.as_os_str().is_empty() || j.argv.is_empty() {
+                String::new()
+            } else {
+                format!("{}  ", dim(&format!("(cd {})", tilde(&j.dir))))
+            };
             println!("  would run  {wh}{}{}", j.method(), j.rm_target());
-            freed += j.before;
+            self.freed += j.before;
             return;
         }
         if let Err(e) = j.run() {
             eprintln!("  {} {}: {e}", paint("31", "failed"), j.label);
-            failed += 1;
+            self.failed = true;
         }
-        let after = size_of(&j.paths);
-        let got = j.before.saturating_sub(after);
-        freed += got;
+        let got = j.before.saturating_sub(size_of(&j.paths));
+        self.freed += got;
         println!(
             "  {}  {}  freed {}",
             paint("32", "done"),
             j.label,
             human(got)
         );
+    }
+}
+
+pub fn run_clean(roots: &[PathBuf], arts: &[&Artifact], caches: &[Cache], o: &Options) -> i32 {
+    let root = &roots[0];
+    let p = plan(root, arts, o);
+    let mut runner = Runner {
+        dry_run: o.dry_run,
+        freed: 0,
+        failed: false,
     };
 
-    if !batch.is_empty() {
-        let total: u64 = batch.iter().map(|j| j.before).sum();
+    if !p.batch.is_empty() {
+        let total: u64 = p.batch.iter().map(|j| j.before).sum();
         println!(
             "{}  {}, {}\n",
             paint("32", "Safe to clean"),
-            plural(batch.len(), "job"),
+            plural(p.batch.len(), "job"),
             human(total)
         );
-        for j in &batch {
+        for j in &p.batch {
             println!(
                 "  {:<10}  {}  {}",
                 human(j.before),
@@ -160,98 +203,106 @@ pub fn run_clean(roots: &[PathBuf], arts: &[&Artifact], caches: &[Cache], o: &Op
                 dim(&format!("via {}{}", j.method(), j.rm_target()))
             );
         }
-        if o.dry_run || o.yes || ask(&format!("\nRun these {} ({})?", batch.len(), human(total))) {
-            batch.iter().for_each(&mut run);
+        let question = format!("\nRun these {} ({})?", p.batch.len(), human(total));
+        if o.dry_run || o.yes || ask(&question) {
+            p.batch.iter().for_each(|j| runner.run(j));
         }
     }
-    if !one_by_one.is_empty() {
+    if !p.one_by_one.is_empty() {
         println!("\n{}  asked one by one", paint("33", "Caution"));
-        for j in &one_by_one {
-            if o.dry_run
-                || ask(&format!(
-                    "{}{}  {} ({})?",
-                    j.method(),
-                    j.rm_target(),
-                    j.label,
-                    human(j.before)
-                ))
-            {
-                run(j);
-            }
-        }
-    }
-
-    if !caches.is_empty() {
-        println!("\n{}  asked one by one", bold("Shared caches"));
-        for c in caches {
-            if c.cmd.is_none() && !o.rm {
-                let why = format!("(no clean command; -rm to rm -rf {})", tilde(&c.path));
-                println!("  {}  {}  {}", dim("skipped"), c.name, dim(&why));
-                continue;
-            }
-            let argv = c.cmd.clone().unwrap_or_default();
-            let j = Job {
-                label: c.name.into(),
-                dir: if argv.is_empty() {
-                    c.path.clone()
-                } else {
-                    PathBuf::new()
-                },
-                paths: if c.path.as_os_str().is_empty() {
-                    vec![]
-                } else {
-                    vec![c.path.clone()]
-                },
-                argv,
-                before: c.bytes,
-            };
-            let note = if c.note.is_empty() {
-                String::new()
-            } else {
-                dim(&format!("  {}", c.note))
-            };
-            let q = format!(
-                "{}  {} {}?{note}",
-                c.name,
-                human(c.bytes),
-                dim(&format!("via {}", c.method()))
+        for j in &p.one_by_one {
+            let question = format!(
+                "{}{}  {} ({})?",
+                j.method(),
+                j.rm_target(),
+                j.label,
+                human(j.before)
             );
-            if o.dry_run || ask(&q) {
-                run(&j);
+            if o.dry_run || ask(&question) {
+                runner.run(j);
             }
         }
     }
+    if !caches.is_empty() {
+        clean_caches(caches, o, &mut runner);
+    }
+    report_left_alone(root, &p);
 
-    if !need_rm.is_empty() {
-        let total: u64 = need_rm.iter().map(|a| a.freed()).sum();
+    let verb = if o.dry_run { "Would free" } else { "Freed" };
+    println!("\n{verb} {}", bold(&human(runner.freed)));
+    i32::from(runner.failed)
+}
+
+/// Offers each shared cache in turn.
+fn clean_caches(caches: &[Cache], o: &Options, runner: &mut Runner) {
+    println!("\n{}  asked one by one", bold("Shared caches"));
+    for c in caches {
+        if c.cmd.is_none() && !o.rm {
+            let why = format!("(no clean command; -rm to rm -rf {})", tilde(&c.path));
+            println!("  {}  {}  {}", dim("skipped"), c.name, dim(&why));
+            continue;
+        }
+        let argv = c.cmd.clone().unwrap_or_default();
+        let j = Job {
+            label: c.name.into(),
+            dir: if argv.is_empty() {
+                c.path.clone()
+            } else {
+                PathBuf::new()
+            },
+            paths: if c.path.as_os_str().is_empty() {
+                vec![]
+            } else {
+                vec![c.path.clone()]
+            },
+            argv,
+            before: c.bytes,
+        };
+        let note = if c.note.is_empty() {
+            String::new()
+        } else {
+            dim(&format!("  {}", c.note))
+        };
+        let question = format!(
+            "{}  {} {}?{note}",
+            c.name,
+            human(c.bytes),
+            dim(&format!("via {}", c.method()))
+        );
+        if o.dry_run || ask(&question) {
+            runner.run(&j);
+        }
+    }
+}
+
+/// Says what clean didn't touch, and the flag that would change that.
+fn report_left_alone(root: &Path, p: &Plan<'_>) {
+    if !p.need_rm.is_empty() {
+        let total: u64 = p.need_rm.iter().map(|a| a.freed()).sum();
         println!(
             "\n{}  {} ({}) no tool cleans; add -rm to rm -rf:",
             dim("Left alone"),
-            plural(need_rm.len(), "artifact"),
+            plural(p.need_rm.len(), "artifact"),
             human(total)
         );
-        for a in &need_rm {
+        for a in &p.need_rm {
             println!("  {}  {}", human(a.freed()), dim(&rel(root, &a.path)));
         }
     }
-    if !caution.is_empty() {
+    if !p.caution.is_empty() {
         println!(
             "\n{}  {} left alone; add -include-caution to be asked about each",
             paint("33", "Caution"),
-            plural(caution.len(), "artifact")
+            plural(p.caution.len(), "artifact")
         );
     }
-    if !unsafe_.is_empty() {
+    if !p.tracked.is_empty() {
         println!(
             "\n{}  {} tracked in git, never cleaned",
             paint("31", "Unsafe"),
-            plural(unsafe_.len(), "artifact")
+            plural(p.tracked.len(), "artifact")
         );
     }
-
-    let verb = if o.dry_run { "Would free" } else { "Freed" };
-    println!("\n{verb} {}", bold(&human(freed)));
-    i32::from(failed > 0)
 }
 
 fn size_of(paths: &[PathBuf]) -> u64 {
@@ -262,10 +313,17 @@ fn size_of(paths: &[PathBuf]) -> u64 {
         .sum()
 }
 
+/// Asks a yes/no question; anything but yes, including a closed stdin, is no.
 fn ask(q: &str) -> bool {
-    print!("{q} [y/N] ");
-    let _ = io::stdout().flush();
+    prompt(q).unwrap_or(false)
+}
+
+fn prompt(q: &str) -> io::Result<bool> {
+    let mut out = io::stdout().lock();
+    write!(out, "{q} [y/N] ")?;
+    out.flush()?;
+    drop(out);
     let mut line = String::new();
-    let _ = io::stdin().read_line(&mut line);
-    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+    io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
 }

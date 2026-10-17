@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::io::IsTerminal;
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::SystemTime;
@@ -19,7 +19,7 @@ pub fn paint(code: &str, s: &str) -> String {
     if color() {
         format!("\x1b[{code}m{s}\x1b[0m")
     } else {
-        s.to_string()
+        s.to_owned()
     }
 }
 
@@ -40,6 +40,7 @@ pub fn safety_label(s: Safety) -> String {
     paint(code, s.as_str())
 }
 
+#[expect(clippy::cast_precision_loss, reason = "shown to one decimal place")]
 pub fn human(b: u64) -> String {
     const UNIT: u64 = 1024;
     if b < UNIT {
@@ -65,10 +66,10 @@ pub fn ago(t: Option<SystemTime>) -> String {
         .as_secs();
     let (hours, days) = (secs / 3600, secs / 86_400);
     match () {
-        _ if hours < 1 => format!("{}m ago", secs / 60),
-        _ if hours < 48 => format!("{hours}h ago"),
-        _ if days < 60 => format!("{days}d ago"),
-        _ => format!("{}mo ago", days / 30),
+        () if hours < 1 => format!("{}m ago", secs / 60),
+        () if hours < 48 => format!("{hours}h ago"),
+        () if days < 60 => format!("{days}d ago"),
+        () => format!("{}mo ago", days / 30),
     }
 }
 
@@ -129,7 +130,7 @@ struct Table(Vec<Vec<String>>);
 impl Table {
     /// One dim span over the whole header line, split into its cells.
     fn header(cols: &[&str]) -> Self {
-        Table(vec![
+        Self(vec![
             dim(&cols.join("\t"))
                 .split('\t')
                 .map(String::from)
@@ -217,7 +218,7 @@ pub fn print_list(root: &Path, arts: &[&Artifact]) {
 #[derive(Default)]
 struct Node<'a> {
     bytes: u64,
-    children: BTreeMap<String, Node<'a>>,
+    children: BTreeMap<String, Self>,
     art: Option<&'a Artifact>,
 }
 
@@ -227,7 +228,7 @@ pub fn print_tree(root: &Path, arts: &[&Artifact]) {
         let mut n = &mut top;
         n.bytes += a.freed();
         for part in rel(root, &a.path).split('/') {
-            n = n.children.entry(part.to_string()).or_default();
+            n = n.children.entry(part.to_owned()).or_default();
             n.bytes += a.freed();
         }
         n.art = Some(a);
@@ -236,8 +237,8 @@ pub fn print_tree(root: &Path, arts: &[&Artifact]) {
     walk_tree(&top, "");
 }
 
-fn walk_tree(n: &Node, prefix: &str) {
-    let mut kids: Vec<(&String, &Node)> = n.children.iter().collect();
+fn walk_tree(n: &Node<'_>, prefix: &str) {
+    let mut kids: Vec<(&String, &Node<'_>)> = n.children.iter().collect();
     kids.sort_by_key(|k| std::cmp::Reverse(k.1.bytes));
     let last = kids.len().saturating_sub(1);
     for (i, (name, mut c)) in kids.into_iter().enumerate() {
@@ -248,15 +249,18 @@ fn walk_tree(n: &Node, prefix: &str) {
         };
         // Fold single-child chains (a/b/c) into one line, the way most tree views do.
         let mut name = name.clone();
-        while c.art.is_none() && c.children.len() == 1 {
-            let (only_name, only) = c.children.iter().next().unwrap();
+        while c.art.is_none() {
+            let mut children = c.children.iter();
+            let (Some((only_name, only)), None) = (children.next(), children.next()) else {
+                break;
+            };
             name = format!("{name}/{only_name}");
             c = only;
         }
         if let Some(a) = c.art {
             let mut note = format!("clean: {}, rebuild: {}", method(a), a.rebuild);
             if !a.why.is_empty() {
-                note += &format!(" ({})", a.why);
+                note = format!("{note} ({})", a.why);
             }
             println!(
                 "{prefix}{branch}{}  {}  {}  {}  {}",
