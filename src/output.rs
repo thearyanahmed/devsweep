@@ -122,13 +122,19 @@ pub fn summary(roots: &[PathBuf], arts: &[&Artifact]) {
     );
 }
 
-/// Aligns cells into columns two spaces apart, like Go's tabwriter, measuring text without its color codes. The last
-/// cell of a row isn't padded.
+/// Aligns cells into columns two spaces apart, exactly like Go's tabwriter: a cell's width is its character count,
+/// color codes included, which gives colored columns their extra breathing room. The last cell of a row isn't padded.
 struct Table(Vec<Vec<String>>);
 
 impl Table {
+    /// One dim span over the whole header line, split into its cells.
     fn header(cols: &[&str]) -> Self {
-        Table(vec![cols.iter().map(|c| dim(c)).collect()])
+        Table(vec![
+            dim(&cols.join("\t"))
+                .split('\t')
+                .map(String::from)
+                .collect(),
+        ])
     }
 
     fn row(&mut self, cells: Vec<String>) {
@@ -142,7 +148,7 @@ impl Table {
                 self.0
                     .iter()
                     .filter_map(|r| r.get(i))
-                    .map(|c| visible_width(c))
+                    .map(|c| width(c))
                     .max()
                     .unwrap_or(0)
             })
@@ -152,7 +158,7 @@ impl Table {
             for (i, cell) in row.iter().enumerate() {
                 line += cell;
                 if i + 1 < row.len() {
-                    line += &" ".repeat(widths[i] - visible_width(cell) + 2);
+                    line += &" ".repeat(widths[i] - width(cell) + 2);
                 }
             }
             println!("{line}");
@@ -160,18 +166,8 @@ impl Table {
     }
 }
 
-fn visible_width(s: &str) -> usize {
-    let mut n = 0;
-    let mut in_escape = false;
-    for c in s.chars() {
-        match (in_escape, c) {
-            (false, '\x1b') => in_escape = true,
-            (true, 'm') => in_escape = false,
-            (true, _) => {}
-            (false, _) => n += 1,
-        }
-    }
-    n
+fn width(s: &str) -> usize {
+    s.chars().count()
 }
 
 /// How clean removes an artifact; rm -rf stands out since it needs -rm.
@@ -326,8 +322,8 @@ mod tests {
     }
 
     #[test]
-    fn width_ignores_color() {
-        assert_eq!(visible_width("\x1b[32msafe\x1b[0m"), 4);
-        assert_eq!(visible_width("└── a"), 5);
+    fn width_counts_color_codes_like_go() {
+        assert_eq!(width("\x1b[32msafe\x1b[0m"), 13);
+        assert_eq!(width("└── a"), 5);
     }
 }
