@@ -247,10 +247,19 @@ fn main() {
     }
 
     if o.json {
-        let mut out = serde_json::json!({ "roots": roots, "artifacts": arts });
-        if o.caches {
-            out["caches"] = serde_json::to_value(caches::caches()).unwrap();
+        // Keys in the order Go's encoding/json gives a map: sorted.
+        #[derive(serde::Serialize)]
+        struct Out<'a> {
+            artifacts: &'a [&'a Artifact],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            caches: Option<Vec<caches::Cache>>,
+            roots: &'a [PathBuf],
         }
+        let out = Out {
+            artifacts: &arts,
+            caches: o.caches.then(caches::caches),
+            roots: &roots,
+        };
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         return;
     }
