@@ -14,8 +14,8 @@ use std::process;
 use std::time::{Duration, SystemTime};
 
 use output::{
-    Group, ago, bold, dim, group_heading, groups, human, plural, print_caches, print_list,
-    print_tree, reset, safety_label, summary, tilde,
+    Group, Order, SortBy, ago, bold, dim, group_heading, groups, human, plural, print_caches,
+    print_list, print_tree, reset, safety_label, summary, tilde,
 };
 use rules::Safety;
 use scan::Artifact;
@@ -82,6 +82,10 @@ const FLAGS: &[Flag] = &[
         "rm",
         "clean: also rm -rf artifacts and caches no tool has a clean command for (node_modules, .next, ...)",
     ),
+    flag(
+        "reverse",
+        "reverse the order: smallest, most recently built or Z to A first",
+    ),
     string("sort", "size", "sort by size, age or path"),
     flag("tree", "show a tree instead of a table"),
     flag("yes", "clean: don't ask before deleting safe artifacts"),
@@ -104,7 +108,7 @@ pub struct Options {
     pub older: Option<Duration>,
     pub min: u64,
     pub kinds: Option<HashSet<String>>,
-    pub sort_by: String,
+    pub order: Order,
     pub group: Option<Group>,
     /// The string flags as given, for saying which ones hid artifacts.
     raw: BTreeMap<&'static str, String>,
@@ -297,7 +301,15 @@ fn options(set: &BTreeMap<&'static str, String>) -> Options {
         older: (!older.is_empty()).then(|| parse_age(&older).unwrap_or_else(|e| fail(e))),
         min: parse_size(&get("min")).unwrap_or_else(|e| fail(e)),
         kinds: (!kinds.is_empty()).then(|| kinds.split(',').map(|k| k.trim().to_owned()).collect()),
-        sort_by: get("sort"),
+        order: Order {
+            by: match get("sort").as_str() {
+                "size" => SortBy::Size,
+                "age" => SortBy::Age,
+                "path" => SortBy::Path,
+                other => fail(format!("bad -sort {other:?}: use size, age or path")),
+            },
+            reverse: on("reverse"),
+        },
         group: match get("group").as_str() {
             "" => None,
             "project" => Some(Group::Project),
@@ -406,13 +418,13 @@ fn main() {
         match (o.tree, o.group) {
             // The tree already groups by project, folder by folder.
             (true, Some(by @ (Group::Kind | Group::Safety))) => {
-                for (name, members) in groups(root, &under, by, &o.sort_by) {
+                for (name, members) in groups(root, &under, by, o.order) {
                     println!("{}", group_heading(by, &name, &members));
                     print_tree(root, &members);
                 }
             }
             (true, _) => print_tree(root, &under),
-            (false, group) => print_list(root, &under, group, &o.sort_by),
+            (false, group) => print_list(root, &under, group, o.order),
         }
     }
     if o.caches {
@@ -433,11 +445,7 @@ fn filter<'a>(all: &'a [Artifact], o: &Options) -> Vec<&'a Artifact> {
         })
         .filter(|a| o.kinds.as_ref().is_none_or(|k| k.contains(a.kind)))
         .collect();
-    match o.sort_by.as_str() {
-        "age" => shown.sort_by_key(|a| a.last_built),
-        "path" => shown.sort_by(|a, b| a.path.cmp(&b.path)),
-        _ => shown.sort_by_key(|a| std::cmp::Reverse(a.freed())),
-    }
+    o.order.sort(&mut shown);
     shown
 }
 

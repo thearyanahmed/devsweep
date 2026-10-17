@@ -14,7 +14,7 @@ use crate::output::plural;
 use crate::rules::{self, Safety, exists};
 
 /// One directory of build output that some project claims.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct Artifact {
     pub path: PathBuf,
     pub project: PathBuf,

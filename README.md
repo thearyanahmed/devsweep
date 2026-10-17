@@ -9,6 +9,7 @@ devsweep                      # table of everything under ~/dev
 devsweep -tree                # the same as a tree
 devsweep -caches              # plus shared caches: cargo, go, npm, pnpm, brew, docker, ...
 devsweep -older 30d -kind rust,node ~/dev ~/work
+devsweep -sort size -reverse  # smallest first; -sort age or path, -reverse works for each
 devsweep -json                # for scripts
 devsweep clean --dry-run      # what clean would run
 devsweep clean                # runs the safe ones after one yes

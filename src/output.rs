@@ -225,6 +225,38 @@ fn method(a: &Artifact) -> String {
     }
 }
 
+/// What -sort orders by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortBy {
+    /// The most to free first.
+    Size,
+    /// The longest unbuilt first.
+    Age,
+    /// A to Z.
+    Path,
+}
+
+/// -sort, and whether -reverse turns it around.
+#[derive(Debug, Clone, Copy)]
+pub struct Order {
+    pub by: SortBy,
+    pub reverse: bool,
+}
+
+impl Order {
+    /// Sorts artifacts in this order.
+    pub fn sort(self, arts: &mut [&Artifact]) {
+        match self.by {
+            SortBy::Size => arts.sort_by_key(|a| std::cmp::Reverse(a.freed())),
+            SortBy::Age => arts.sort_by_key(|a| a.last_built),
+            SortBy::Path => arts.sort_by(|a, b| a.path.cmp(&b.path)),
+        }
+        if self.reverse {
+            arts.reverse();
+        }
+    }
+}
+
 /// What -group puts each artifact under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {
@@ -243,13 +275,14 @@ impl Group {
     }
 }
 
-/// The artifacts under each group, keeping their order within it. Groups follow -sort: the most to free first, A to
-/// Z by path, or the longest unbuilt first. Safety groups keep their own order instead: safe, caution, unsafe.
+/// The artifacts under each group, keeping their order within it. Groups follow -sort and -reverse too: by their total
+/// size, their longest unbuilt artifact, or their name. Safety groups keep their own order instead: safe, caution,
+/// unsafe.
 pub fn groups<'a>(
     root: &Path,
     arts: &[&'a Artifact],
     by: Group,
-    sort_by: &str,
+    order: Order,
 ) -> Vec<(String, Vec<&'a Artifact>)> {
     let mut groups: Vec<(String, Vec<&Artifact>)> = Vec::new();
     for &a in arts {
@@ -259,14 +292,20 @@ pub fn groups<'a>(
             None => groups.push((key, vec![a])),
         }
     }
-    match sort_by {
-        _ if by == Group::Safety => groups.sort_by_key(|(_, m)| m.first().map(|a| a.safety)),
-        "path" => groups.sort_by(|a, b| a.0.cmp(&b.0)),
-        "age" => groups.sort_by_key(|(_, m)| m.iter().filter_map(|a| a.last_built).min()),
-        _ => {
+    if by == Group::Safety {
+        groups.sort_by_key(|(_, m)| m.first().map(|a| a.safety));
+        return groups;
+    }
+    match order.by {
+        SortBy::Path => groups.sort_by(|a, b| a.0.cmp(&b.0)),
+        SortBy::Age => groups.sort_by_key(|(_, m)| m.iter().filter_map(|a| a.last_built).min()),
+        SortBy::Size => {
             groups
                 .sort_by_key(|(_, m)| std::cmp::Reverse(m.iter().map(|a| a.freed()).sum::<u64>()));
         }
+    }
+    if order.reverse {
+        groups.reverse();
     }
     groups
 }
@@ -289,7 +328,7 @@ pub fn group_heading(by: Group, name: &str, members: &[&Artifact]) -> String {
     )
 }
 
-pub fn print_list(root: &Path, arts: &[&Artifact], group: Option<Group>, sort_by: &str) {
+pub fn print_list(root: &Path, arts: &[&Artifact], group: Option<Group>, order: Order) {
     const COLS: [&str; 8] = [
         "SIZE",
         "SAFETY",
@@ -347,7 +386,7 @@ pub fn print_list(root: &Path, arts: &[&Artifact], group: Option<Group>, sort_by
     match group {
         None => rows(&mut t, arts),
         Some(by) => {
-            for (name, members) in groups(root, arts, by, sort_by) {
+            for (name, members) in groups(root, arts, by, order) {
                 t.line(group_heading(by, &name, &members));
                 rows(&mut t, &members);
             }
