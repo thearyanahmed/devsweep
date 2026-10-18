@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use crate::caches::Cache;
+use crate::docker::Volume;
 use crate::rules::Safety;
 use crate::scan::Artifact;
 
@@ -480,6 +481,46 @@ pub fn print_caches(cs: &mut [Cache]) {
             c.name.into(),
             path,
             dim(&format!("{}{}", c.method(), notes(c.note))),
+        ]);
+    }
+    t.print();
+}
+
+/// Docker's volumes: who uses each, and whether removing it is wise.
+pub fn print_volumes(volumes: &[Volume]) {
+    let total: u64 = volumes.iter().map(|v| v.bytes).sum();
+    println!(
+        "{}  {}  {}",
+        bold("Docker volumes"),
+        human(total),
+        dim("(data containers wrote; devsweep clean -volumes offers each one)")
+    );
+    let mut t = Table::new(&["SIZE", "SAFETY", "VOLUME", "USED BY", "CLEAN WITH"], 0);
+    for v in volumes {
+        let used_by = if v.containers.is_empty() {
+            dim("-")
+        } else {
+            v.containers
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{} {}",
+                        c.name,
+                        dim(if c.running { "running" } else { "stopped" })
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let clean = dim(&v
+            .clean_cmd()
+            .map_or_else(|| v.blocker(), |argv| argv.join(" ")));
+        t.row(vec![
+            human(v.bytes),
+            safety_label(v.safety),
+            v.name.clone(),
+            used_by,
+            clean,
         ]);
     }
     t.print();

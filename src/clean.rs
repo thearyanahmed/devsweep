@@ -6,6 +6,7 @@ use std::process::Command;
 use crate::Options;
 use crate::caches::Cache;
 use crate::cmd::on_path;
+use crate::docker::Volume;
 use crate::output::{bold, dim, human, paint, plural, rel, tilde};
 use crate::rules::{Safety, exists};
 use crate::scan::{Artifact, measure};
@@ -190,7 +191,13 @@ impl Runner {
     }
 }
 
-pub fn run_clean(roots: &[PathBuf], arts: &[&Artifact], caches: &[Cache], o: &Options) -> i32 {
+pub fn run_clean(
+    roots: &[PathBuf],
+    arts: &[&Artifact],
+    caches: &[Cache],
+    volumes: &[Volume],
+    o: &Options,
+) -> i32 {
     let root = &roots[0];
     let p = plan(root, arts, o);
     let mut runner = Runner {
@@ -239,6 +246,9 @@ pub fn run_clean(roots: &[PathBuf], arts: &[&Artifact], caches: &[Cache], o: &Op
     }
     if !caches.is_empty() {
         clean_caches(caches, o, &mut runner);
+    }
+    if !volumes.is_empty() {
+        clean_volumes(volumes, &mut runner);
     }
     report_left_alone(root, &p);
 
@@ -293,6 +303,36 @@ fn clean_caches(caches: &[Cache], o: &Options, runner: &mut Runner) {
             c.name,
             human(c.bytes),
             dim(&format!("via {}", c.method()))
+        );
+        if runner.dry(&j) || ask(&question) {
+            runner.run(&j);
+        }
+    }
+}
+
+/// Offers each Docker volume no container uses, one by one. Docker won't remove the others, so they're only named,
+/// with what stands in the way.
+fn clean_volumes(volumes: &[Volume], runner: &mut Runner) {
+    println!("\n{}  asked one by one", bold("Docker volumes"));
+    for v in volumes {
+        let Some(argv) = v.clean_cmd() else {
+            let why = format!("({}: {})", v.why, v.blocker());
+            println!("  {}  {}  {}", dim("skipped"), v.name, dim(&why));
+            continue;
+        };
+        let j = Job {
+            label: v.name.clone(),
+            dir: PathBuf::new(),
+            argv,
+            paths: vec![],
+            before: v.bytes,
+        };
+        let question = format!(
+            "{}  {} {}?{}",
+            v.name,
+            human(v.bytes),
+            dim(&format!("via {}", j.method())),
+            dim(&format!("  {}", v.why))
         );
         if runner.dry(&j) || ask(&question) {
             runner.run(&j);

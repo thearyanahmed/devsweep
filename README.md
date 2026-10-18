@@ -33,6 +33,11 @@ Some things have no tool command (`node_modules`, `.next`, `__pycache__`, `.venv
 `rm -rf` and are left alone unless you pass `-rm`, and even then `rm -rf` only shows what it would delete until you
 also pass `--dry-run=false`. Tool commands like `cargo clean` run without it.
 
+Docker volumes are listed too, after the projects (`-volumes` shows only them), with the containers using each. One
+a running container uses is unsafe; any other is caution, since volumes hold data. Docker only removes a volume no
+container uses, so `devsweep clean -volumes` offers just those, one by one, and names the containers in the way of the
+rest. It never removes a container.
+
 `-group project`, `-group kind` or `-group safety` groups the listing, under a heading per group with its size.
 
 A project is recognised by a directory name plus a marker beside it (`target` + `Cargo.toml`, `node_modules` +

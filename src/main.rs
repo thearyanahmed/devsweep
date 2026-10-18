@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime};
 
 use output::{
     Group, Order, SortBy, ago, bold, dim, group_heading, groups, human, plural, print_caches,
-    print_list, print_tree, reset, safety_label, summary, tilde,
+    print_list, print_tree, print_volumes, reset, safety_label, summary, tilde,
 };
 use rules::Safety;
 use scan::Artifact;
@@ -90,6 +90,10 @@ const FLAGS: &[Flag] = &[
     ),
     string("sort", "size", "sort by size, age or path"),
     flag("tree", "show a tree instead of a table"),
+    flag(
+        "volumes",
+        "only Docker volumes; with clean, offer each one for removal",
+    ),
     flag("yes", "clean: don't ask before deleting safe artifacts"),
 ];
 
@@ -107,6 +111,7 @@ pub struct Options {
     pub dry_run: Option<bool>,
     pub caution: bool,
     pub rm: bool,
+    pub volumes: bool,
     pub older: Option<Duration>,
     pub min: u64,
     pub kinds: Option<HashSet<String>>,
@@ -300,6 +305,7 @@ fn options(set: &BTreeMap<&'static str, String>) -> Options {
         dry_run: set.get("dry-run").map(|v| v == "true" || v == "1"),
         caution: on("include-caution"),
         rm: on("rm"),
+        volumes: on("volumes"),
         older: (!older.is_empty()).then(|| parse_age(&older).unwrap_or_else(|e| fail(e))),
         min: parse_size(&get("min")).unwrap_or_else(|e| fail(e)),
         kinds: (!kinds.is_empty()).then(|| kinds.split(',').map(|k| k.trim().to_owned()).collect()),
@@ -362,48 +368,87 @@ fn main() {
     let o = options(&set);
     let roots = resolve_roots(&dirs);
 
-    // The shared caches don't depend on the projects: measure them at the same time.
+    // -volumes on its own: just Docker's volumes, no scan.
+    if o.volumes && !clean && !o.json {
+        let volumes = docker::volumes();
+        if volumes.is_empty() {
+            println!("{}", dim("no Docker volumes (or Docker isn't running)"));
+        } else {
+            print_volumes(&volumes);
+        }
+        return;
+    }
+
+    // Shared caches and Docker's volumes don't depend on the projects: look them up at the same time.
     let pending_caches = o.caches.then(|| std::thread::spawn(caches::caches));
     let caches = move || pending_caches.map(|t| t.join().expect("the cache thread panicked"));
+    let pending_volumes = (!clean || o.volumes).then(|| std::thread::spawn(docker::volumes));
+    let volumes = move || {
+        pending_volumes.map_or_else(Vec::new, |t| t.join().expect("the docker thread panicked"))
+    };
     let all = scan::scan(&roots);
     let shown = filter(&all, &o);
 
     if clean {
         let caches = caches().unwrap_or_default();
-        process::exit(clean::run_clean(&roots, &shown, &caches, &o));
+        let volumes = volumes();
+        process::exit(clean::run_clean(&roots, &shown, &caches, &volumes, &o));
     }
 
     if o.json {
-        // Keys in the order Go's encoding/json gives a map: sorted.
-        #[derive(serde::Serialize)]
-        struct Out<'a> {
-            artifacts: &'a [&'a Artifact],
-            #[serde(skip_serializing_if = "Option::is_none")]
-            caches: Option<Vec<caches::Cache>>,
-            roots: &'a [PathBuf],
-        }
-        let out = Out {
-            artifacts: &shown,
-            caches: caches(),
-            roots: &roots,
-        };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&out).expect("paths and strings always serialize")
-        );
+        print_json(&roots, &shown, caches(), volumes());
         return;
     }
+    print_listing(&roots, &all, &shown, &o);
+    let volumes = volumes();
+    if !volumes.is_empty() {
+        println!();
+        print_volumes(&volumes);
+    }
+    if o.caches {
+        print_caches(&mut caches().unwrap_or_default());
+    }
+}
 
+fn print_json(
+    roots: &[PathBuf],
+    shown: &[&Artifact],
+    caches: Option<Vec<caches::Cache>>,
+    volumes: Vec<docker::Volume>,
+) {
+    // Keys in the order Go's encoding/json gives a map: sorted.
+    #[derive(serde::Serialize)]
+    struct Out<'a> {
+        artifacts: &'a [&'a Artifact],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caches: Option<Vec<caches::Cache>>,
+        roots: &'a [PathBuf],
+        volumes: Vec<docker::Volume>,
+    }
+    let out = Out {
+        artifacts: shown,
+        caches,
+        roots,
+        volumes,
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out).expect("paths and strings always serialize")
+    );
+}
+
+/// The summary, then each root's artifacts as a table or a tree, grouped as asked.
+fn print_listing(roots: &[PathBuf], all: &[Artifact], shown: &[&Artifact], o: &Options) {
     // The summary heads the listing: the note and the table or tree follow it directly.
-    summary(&roots, &shown);
+    summary(roots, shown);
     if all.is_empty() {
         println!("{}", dim("nothing found"));
     }
     let hidden = all.len() - shown.len();
     if hidden > 0 {
-        println!("{}", dim(&hidden_note(&all, &shown, hidden, &o)));
+        println!("{}", dim(&hidden_note(all, shown, hidden, o)));
     }
-    for root in &roots {
+    for root in roots {
         let under: Vec<&Artifact> = shown
             .iter()
             .copied()
@@ -428,9 +473,6 @@ fn main() {
             (true, _) => print_tree(root, &under),
             (false, group) => print_list(root, &under, group, o.order),
         }
-    }
-    if o.caches {
-        print_caches(&mut caches().unwrap_or_default());
     }
 }
 
