@@ -25,8 +25,10 @@ make build      # or just build ./devsweep
 
 ```sh
 devsweep                          # everything under ~/dev, then Docker's images and volumes
-devsweep ~/dev ~/work             # other folders, any number
-devsweep -tree                    # the same as a tree of folders
+devsweep ~/dev ~/work             # only these folders, any number; Docker left out
+devsweep -pwd                     # the folder you are in
+devsweep -tree                    # the same as a tree of folders: size, safety, clean command
+devsweep -tree -detailed          # the tree with kind, last build, rebuild command and why
 devsweep -group kind              # grouped: project, kind, safety, or image (Docker)
 devsweep -sort age:asc            # most recently built first; size, age, path, :asc or :desc
 devsweep -older 30d -kind rust    # only Rust projects not built for a month
@@ -36,7 +38,10 @@ devsweep -json                    # everything, for scripts
 
 devsweep clean --dry-run          # what clean would run, running nothing
 devsweep clean                    # runs the safe tool commands after one yes
+devsweep clean -pwd               # only the project or folder you are in
+devsweep clean -pwd -y            # the same, answering yes to every question
 devsweep clean -caches -images    # also offers caches and Docker images, one by one
+devsweep clean -upto caution      # also caution artifacts (dist/, no lockfile), one by one
 ```
 
 Flags go before or after the folders. One-word flags take one dash (`-tree`), several words two (`--dry-run`); a
@@ -69,15 +74,24 @@ Each kind is a sweeper in `src/builtin/`, one file per ecosystem; to add your ow
 | | Meaning | `clean` |
 | --- | --- | --- |
 | safe | the project's own tooling recreates it exactly: a lockfile is there and git ignores it | asked once for all of them |
-| caution | likely recreatable, but the result may differ or it may hold something you want: `dist/`, no lockfile, not gitignored | only with `--include-caution`, asked one by one |
-| unsafe | git tracks files in it | never |
+| caution | likely recreatable, but the result may differ or it may hold something you want: `dist/`, no lockfile, not gitignored | only with `-upto caution`, asked one by one |
+| unsafe | git tracks files in it | only with `-upto unsafe`, one by one, typing each folder's name; never with uncommitted changes |
 
 Git decides the last word: a folder with tracked files is unsafe whatever it's called, and one git doesn't ignore is at
 least caution.
 
+`-upto` sets the least safe artifacts `clean` offers: `safe` (the default), `caution`, or `unsafe`, each including the
+ones before it. Unsafe ones are asked about last, and `-y` never answers them: you type the folder's name (`dist`) to
+confirm. One with uncommitted changes, untracked files included, is refused, so `git checkout -- <folder>` can always
+bring back what was deleted.
+
 ## Cleaning
 
-`devsweep clean` takes the same folders and filters as the listing, shows what it will do, and asks.
+`devsweep clean` takes the same folders and filters as the listing, shows what it will do, and asks. `-pwd` cleans
+only the folder you are in.
+
+`-y` answers every question yes, for scripts, except the typed confirmation of unsafe ones. It doesn't widen what is offered (that is still `-upto`,
+`-rm`, `-caches`, `-images`, `-volumes`) and doesn't turn off the dry run of `rm -rf`.
 
 **Tool commands first.** Each artifact is cleaned by its own tool, run in its project: `cargo clean`, `mix clean`,
 `swift package reset`, `npm run clean`. Several artifacts sharing one command (a Cargo workspace) run it once.
@@ -89,6 +103,7 @@ shows what it would delete:
 | You pass | Tool commands | rm -rf |
 | --- | --- | --- |
 | nothing | run, after the usual yes | only shown |
+| `-detailed` | with `-tree`, also each artifact's kind, last build, rebuild command and why it isn't safe |
 | `--dry-run` | only shown | only shown |
 | `--dry-run=false` | run | deletes |
 
@@ -105,7 +120,9 @@ Some things it refuses outright, whatever a sweeper says:
 
 ## Docker
 
-Docker is part of every listing, after the projects, read from one `docker system df --verbose`:
+Docker is listed after the projects when you run `devsweep` with no folders. Name folders (or pass `-pwd`) and only
+those are listed, since Docker belongs to the whole machine; `-images` and `-volumes` still ask for it. It is all read
+from one `docker system df --verbose`:
 
 - **Images**: the size only that image takes, with the layers it shares with other images shown apart
   (`+2.9 MiB shared`), since removing it doesn't free those.
@@ -168,7 +185,8 @@ the tool's own command where it has one:
   (`size:asc` is smallest first, `path:desc` Z to A). Rows inside groups and the groups themselves both follow it.
 - **`-min`** (default 1M), **`-older`**, **`-kind`** filter; a line under the summary says how many artifacts they
   hid and why, so an empty result isn't a mystery.
-- **`-json`**: artifacts, roots, Docker's images, containers and volumes, and with `-caches` the caches.
+- **`-json`**: artifacts, roots, Docker's images, containers and volumes (when Docker is listed), and with
+  `-caches` the caches.
 
 Output is colored on a terminal and plain otherwise, or with `NO_COLOR` set.
 
@@ -177,18 +195,21 @@ Output is colored on a terminal and plain otherwise, or with `NO_COLOR` set.
 | Flag | |
 | --- | --- |
 | `-caches` | also list shared tool caches; with clean, offer each one |
+| `-detailed` | with `-tree`, also each artifact's kind, last build, rebuild command and why it isn't safe |
 | `--dry-run` | clean: show what would run, run nothing; rm -rf is always a dry run unless `--dry-run=false` |
-| `--include-caution` | clean: also offer caution artifacts, each asked one by one |
 | `-group` | group by `project`, `kind` or `safety`; `image` arranges Docker by image |
 | `-images` | only Docker images; with clean, offer each one |
 | `-json` | print JSON |
 | `-kind` | only these kinds, comma separated: `rust,node,go,python,swift,zig,elixir,cmake`, or any sweeper you add |
 | `-min` | hide artifacts smaller than this, e.g. `100M`, `1G` (default `1M`) |
 | `-older` | only artifacts not built for this long, e.g. `14d`, `3w`, `2mo`, `12h` |
+| `-pwd` | the current folder instead of `~/dev`, as if named; with folders, it is added to them |
 | `-rm` | clean: also offer what only rm -rf removes (`node_modules`, `.next`, ...) |
 | `-sort` | `size` (default), `age` or `path`, optionally with `:asc` or `:desc` |
-| `-tree` | a tree instead of a table |
+| `-tree` | a tree instead of a table: each artifact's size, safety and clean command |
+| `-upto` | clean: the least safe artifacts to offer: `safe` (default), `caution` (each asked) or `unsafe` (each typed out, never by `-y`) |
 | `-volumes` | only Docker volumes; with clean, offer each one |
+| `-y` | clean: answer yes to every question but an unsafe one's; what is offered still follows the other flags |
 
 ## Adding your own
 

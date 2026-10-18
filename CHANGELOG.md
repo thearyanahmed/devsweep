@@ -5,8 +5,21 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `--include-caution` is replaced by `-upto safe|caution|unsafe`. `-upto unsafe` can clean folders git tracks files
+  in: one by one, each confirmed by typing its name (never by `-y`), and only with no uncommitted changes in it.
+
+- Naming folders (or `-pwd`) lists only what's in them: Docker is left out unless `-images` or `-volumes` asks for it.
+
+- `-tree` shows only each artifact's size, safety and clean command; `-detailed` brings back its kind, last build,
+  rebuild command and why it isn't safe.
+
 ### Added
 
+- `clean -y` answers yes to every question. What is offered still follows the other flags, and `rm -rf` stays a dry
+  run unless `--dry-run=false`.
+- `-pwd` scans, or with `clean` cleans, the folder you are in: `devsweep clean -pwd`.
 - More shared caches with `-caches`: Gradle, Maven, Hugging Face, poetry, pre-commit, deno, node-gyp, Playwright,
   Cypress and Puppeteer browsers, Composer, Dart pub, Terraform plugins, ccache, sccache, CocoaPods, Carthage,
   SwiftPM, Xcode archives, device support, documentation cache and device logs, simulator caches and logs, the

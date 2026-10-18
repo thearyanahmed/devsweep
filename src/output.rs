@@ -426,7 +426,9 @@ struct Node<'a> {
 }
 
 /// The artifacts as a tree of the folders under `root`, which the lines above have already named.
-pub(crate) fn print_tree(root: &Path, arts: &[&Artifact]) {
+/// One line per artifact: its size, safety and how it's cleaned; `detailed` adds its kind, last build, how it's
+/// rebuilt and why it isn't safe.
+pub(crate) fn print_tree(root: &Path, arts: &[&Artifact], detailed: bool) {
     let mut top = Node::default();
     for a in arts {
         let mut n = &mut top;
@@ -437,10 +439,10 @@ pub(crate) fn print_tree(root: &Path, arts: &[&Artifact]) {
         }
         n.art = Some(a);
     }
-    walk_tree(&top, "");
+    walk_tree(&top, "", detailed);
 }
 
-fn walk_tree(n: &Node<'_>, prefix: &str) {
+fn walk_tree(n: &Node<'_>, prefix: &str, detailed: bool) {
     let mut kids: Vec<(&String, &Node<'_>)> = n.children.iter().collect();
     kids.sort_by_key(|k| std::cmp::Reverse(k.1.bytes));
     let last = kids.len().saturating_sub(1);
@@ -461,22 +463,30 @@ fn walk_tree(n: &Node<'_>, prefix: &str) {
             c = only;
         }
         if let Some(a) = c.art {
-            let mut note = format!("clean: {}, rebuild: {}", method(a), a.rebuild);
-            if !a.why.is_empty() {
-                note = format!("{note} ({})", a.why);
-            }
-            println!(
-                "{prefix}{branch}{}  {}  {}  {}  {}",
+            let mut line = format!(
+                "{prefix}{branch}{}  {}  {}  {}",
                 paint("36", &name),
                 human(c.bytes),
                 safety_label(a.safety),
-                dim(&format!("{}, built {}", a.kind, ago(a.last_built))),
-                dim(&note),
+                method(a),
             );
+            if detailed {
+                let mut more = format!(
+                    "{}, built {}, rebuild: {}",
+                    a.kind,
+                    ago(a.last_built),
+                    a.rebuild
+                );
+                if !a.why.is_empty() {
+                    more = format!("{more} ({})", a.why);
+                }
+                line = format!("{line}  {}", dim(&more));
+            }
+            println!("{line}");
             continue;
         }
         println!("{prefix}{branch}{name}  {}", dim(&human(c.bytes)));
-        walk_tree(c, &format!("{prefix}{next}"));
+        walk_tree(c, &format!("{prefix}{next}"), detailed);
     }
 }
 

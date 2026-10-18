@@ -69,13 +69,15 @@ impl Job {
 struct Plan<'a> {
     /// Safe: asked about once, together.
     batch: Vec<Job>,
-    /// Caution, with --include-caution: asked about one by one.
+    /// Caution, with -upto caution or unsafe: asked about one by one.
     one_by_one: Vec<Job>,
+    /// Tracked in git, with -upto unsafe: asked about one by one, each confirmed by typing its name.
+    tracked_jobs: Vec<Job>,
     /// No tool cleans these and -rm wasn't given.
     need_rm: Vec<&'a Artifact>,
-    /// Caution, without --include-caution.
+    /// Caution, below -upto caution.
     caution: Vec<&'a Artifact>,
-    /// Tracked in git: never cleaned.
+    /// Tracked in git, below -upto unsafe.
     tracked: Vec<&'a Artifact>,
     /// A sweeper said they can't be removed now.
     blocked: Vec<&'a Artifact>,
@@ -97,7 +99,7 @@ fn plan<'a>(root: &Path, arts: &[&'a Artifact], o: &Options) -> Plan<'a> {
     let mut by_cmd: HashMap<CmdKey, Slot> = HashMap::new();
     for &a in arts {
         let to_batch = match a.safety {
-            Safety::Unsafe => {
+            Safety::Unsafe if o.upto < Safety::Unsafe => {
                 p.tracked.push(a);
                 continue;
             }
@@ -109,17 +111,18 @@ fn plan<'a>(root: &Path, arts: &[&'a Artifact], o: &Options) -> Plan<'a> {
                 p.need_rm.push(a);
                 continue;
             }
-            Safety::Caution if !o.caution => {
+            Safety::Caution if o.upto < Safety::Caution => {
                 p.caution.push(a);
                 continue;
             }
             Safety::Caution => false,
             Safety::Safe => true,
+            Safety::Unsafe => {
+                p.tracked_jobs.push(job(root, a));
+                continue;
+            }
         };
-        let argv = match &a.clean {
-            Clean::Tool(argv) => argv.clone(),
-            Clean::RemoveDir | Clean::Blocked(_) => Vec::new(),
-        };
+        let argv = job(root, a).argv;
         if !argv.is_empty()
             && let Some(&Slot { in_batch, index }) = by_cmd.get(&(a.project.clone(), argv.clone()))
         {
@@ -144,15 +147,23 @@ fn plan<'a>(root: &Path, arts: &[&'a Artifact], o: &Options) -> Plan<'a> {
             };
             by_cmd.insert((a.project.clone(), argv.clone()), slot);
         }
-        list.push(Job {
-            label: rel(root, &a.path),
-            dir: a.project.clone(),
-            argv,
-            paths: vec![a.path.clone()],
-            before: a.bytes,
-        });
+        list.push(job(root, a));
     }
     p
+}
+
+/// Cleaning one artifact on its own.
+fn job(root: &Path, a: &Artifact) -> Job {
+    Job {
+        label: rel(root, &a.path),
+        dir: a.project.clone(),
+        argv: match &a.clean {
+            Clean::Tool(argv) => argv.clone(),
+            Clean::RemoveDir | Clean::Blocked(_) => Vec::new(),
+        },
+        paths: vec![a.path.clone()],
+        before: a.bytes,
+    }
 }
 
 /// Runs jobs, or with --dry-run only says what it would run, and keeps the score.
@@ -165,6 +176,8 @@ struct Runner {
     /// An rm -rf was left as a dry run only because --dry-run wasn't given.
     rm_held_back: bool,
     failed: bool,
+    /// -y: every question is answered yes.
+    yes: bool,
 }
 
 impl Runner {
@@ -172,6 +185,15 @@ impl Runner {
     /// runs while an rm -rf, which nothing can undo, stays a dry run.
     fn dry(&self, j: &Job) -> bool {
         self.dry_run.unwrap_or(j.argv.is_empty())
+    }
+
+    /// Asks a yes/no question, or with -y shows it answered.
+    fn ask(&self, q: &str) -> bool {
+        if self.yes {
+            println!("{q} [y/N] y");
+            return true;
+        }
+        ask(q)
     }
 
     fn run(&mut self, j: &Job) {
@@ -217,6 +239,7 @@ pub(crate) fn run_clean(
         would_free: 0,
         rm_held_back: false,
         failed: false,
+        yes: o.yes,
     };
 
     // Every rm -rf waits for a step of its own at the end, after all the tools' own commands.
@@ -241,7 +264,7 @@ pub(crate) fn run_clean(
             );
         }
         let question = format!("\nRun {} ({})?", plural(batch.len(), "job"), human(total));
-        if batch.iter().all(|j| runner.dry(j)) || ask(&question) {
+        if batch.iter().all(|j| runner.dry(j)) || runner.ask(&question) {
             for j in &batch {
                 runner.run(j);
             }
@@ -257,7 +280,7 @@ pub(crate) fn run_clean(
                 j.label,
                 human(j.before)
             );
-            if runner.dry(j) || ask(&question) {
+            if runner.dry(j) || runner.ask(&question) {
                 runner.run(j);
             }
         }
@@ -269,6 +292,9 @@ pub(crate) fn run_clean(
     rm.extend(rm_items.iter());
     if !rm.is_empty() {
         remove_dirs(&rm, &mut runner);
+    }
+    if !p.tracked_jobs.is_empty() {
+        clean_tracked(&p.tracked_jobs, &mut runner);
     }
     report_left_alone(root, &p);
 
@@ -342,7 +368,7 @@ fn clean_items(
         );
         if j.argv.is_empty() {
             rm.push(j);
-        } else if runner.dry(&j) || ask(&question) {
+        } else if runner.dry(&j) || runner.ask(&question) {
             runner.run(&j);
         }
     }
@@ -373,10 +399,69 @@ fn remove_dirs(jobs: &[&Job], runner: &mut Runner) {
         plural(jobs.len(), "folder"),
         human(total)
     );
-    if ask(&question) {
+    if runner.ask(&question) {
         for j in jobs {
             runner.run(j);
         }
+    }
+}
+
+/// The last step, with -upto unsafe: what git tracks files in, one by one, each confirmed by typing its folder's name.
+/// One with uncommitted changes is refused, so that git can always bring back what was deleted.
+fn clean_tracked(jobs: &[Job], runner: &mut Runner) {
+    println!(
+        "\n{}  {}",
+        paint("31", "Unsafe"),
+        dim(
+            "git tracks files in these: type each one's name to clean it; git checkout brings it back"
+        )
+    );
+    for j in jobs {
+        if let Some(why) = uncommitted(j) {
+            println!(
+                "  {}  {}  {}",
+                dim("skipped"),
+                j.label,
+                dim(&format!("({why})"))
+            );
+            continue;
+        }
+        if runner.dry(j) {
+            runner.run(j);
+            continue;
+        }
+        let name = j.paths[0]
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let question = format!(
+            "{}{}  {} ({}): type {} to confirm",
+            j.method(),
+            j.rm_target(),
+            j.label,
+            human(j.before),
+            bold(&name)
+        );
+        if prompt_word(&question, &name).unwrap_or(false) {
+            runner.run(j);
+        }
+    }
+}
+
+/// Why a tracked artifact can't be cleaned now: changes git hasn't committed, or git couldn't say.
+fn uncommitted(j: &Job) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&j.dir)
+        .args(["status", "--porcelain", "--untracked-files=all", "--"])
+        .args(&j.paths)
+        .output();
+    match out {
+        Ok(o) if o.status.success() && o.stdout.is_empty() => None,
+        Ok(o) if o.status.success() => {
+            Some("uncommitted changes in it: commit or stash them first".into())
+        }
+        _ => Some("git couldn't say whether it has uncommitted changes".into()),
     }
 }
 
@@ -460,14 +545,14 @@ fn report_left_alone(root: &Path, p: &Plan<'_>) {
     }
     if !p.caution.is_empty() {
         println!(
-            "\n{}  {} left alone; add --include-caution to be asked about each",
+            "\n{}  {} left alone; add -upto caution to be asked about each",
             paint("33", "Caution"),
             plural(p.caution.len(), "artifact")
         );
     }
     if !p.tracked.is_empty() {
         println!(
-            "\n{}  {} tracked in git, never cleaned",
+            "\n{}  {} tracked in git, left alone; add -upto unsafe to be asked about each",
             paint("31", "Unsafe"),
             plural(p.tracked.len(), "artifact")
         );
@@ -503,6 +588,17 @@ fn prompt(q: &str) -> io::Result<bool> {
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
     Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+/// Asks for `word` to be typed; anything else, including a closed stdin, is no. -y never answers it.
+fn prompt_word(q: &str, word: &str) -> io::Result<bool> {
+    let mut out = io::stdout().lock();
+    write!(out, "{q}: ")?;
+    out.flush()?;
+    drop(out);
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(!word.is_empty() && line.trim() == word)
 }
 
 #[cfg(test)]

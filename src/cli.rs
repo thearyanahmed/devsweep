@@ -48,12 +48,12 @@ const FLAGS: &[Flag] = &[
         "also list shared tool caches (cargo, go, npm, pnpm, brew, ...)",
     ),
     flag(
-        "dry-run",
-        "clean: show what would run, run nothing; rm -rf is always a dry run unless --dry-run=false",
+        "detailed",
+        "-tree: also show each artifact's kind, last build, rebuild command and why it isn't safe",
     ),
     flag(
-        "include-caution",
-        "clean: also offer caution artifacts, each asked one by one",
+        "dry-run",
+        "clean: show what would run, run nothing; rm -rf is always a dry run unless --dry-run=false",
     ),
     string(
         "group",
@@ -81,6 +81,10 @@ const FLAGS: &[Flag] = &[
         "only artifacts not built for this long, e.g. 14d, 3w, 2mo, 12h",
     ),
     flag(
+        "pwd",
+        "the current folder instead of ~/dev, as if given as a folder",
+    ),
+    flag(
         "rm",
         "clean: also rm -rf artifacts and caches no tool has a clean command for (node_modules, .next, ...)",
     ),
@@ -90,9 +94,18 @@ const FLAGS: &[Flag] = &[
         "size, age or path, each its natural way round; add :asc or :desc to choose, e.g. size:asc",
     ),
     flag("tree", "show a tree instead of a table"),
+    string(
+        "upto",
+        "safe",
+        "clean: the least safe artifacts to offer: safe, caution (each asked) or unsafe (each typed out; never -y)",
+    ),
     flag(
         "volumes",
         "only Docker volumes; with clean, offer each one for removal",
+    ),
+    flag(
+        "y",
+        "clean: answer yes to every question but an unsafe one's; what is offered still follows the other flags",
     ),
 ];
 
@@ -103,12 +116,17 @@ const FLAGS: &[Flag] = &[
 #[derive(Debug)]
 pub(crate) struct Options {
     pub(crate) tree: bool,
+    /// -detailed: the tree shows everything the table does.
+    pub(crate) detailed: bool,
     pub(crate) json: bool,
     pub(crate) caches: bool,
     /// --dry-run as given: `None` leaves tool commands running and rm -rf as a dry run.
     pub(crate) dry_run: Option<bool>,
-    pub(crate) caution: bool,
+    /// -upto: the least safe artifacts clean offers.
+    pub(crate) upto: Safety,
     pub(crate) rm: bool,
+    /// -y: clean answers its own questions.
+    pub(crate) yes: bool,
     pub(crate) volumes: bool,
     pub(crate) images: bool,
     /// -group image: Docker's containers and volumes under the image they come from.
@@ -118,6 +136,9 @@ pub(crate) struct Options {
     pub(crate) kinds: Option<HashSet<String>>,
     pub(crate) order: Order,
     pub(crate) group: Option<Group>,
+    /// Folders were named (or -pwd given): list only what's in them, leaving out what belongs to the whole machine,
+    /// such as Docker, unless its flag asks for it.
+    pub(crate) scoped: bool,
     /// The string flags as given, for saying which ones hid artifacts.
     raw: BTreeMap<&'static str, String>,
 }
@@ -179,7 +200,7 @@ fn help() -> String {
             "probably recreatable, but may differ or hold something you want (dist/, no lockfile, not gitignored)"
         ),
         safety_label(Safety::Unsafe),
-        dim("git tracks files in it; never deleted"),
+        dim("git tracks files in it; cleaned only with -upto unsafe, each typed out"),
         bold("Flags:"),
     );
     // Descriptions in a column beside the flags, three spaces past the longest one, as in the sections above.
@@ -312,11 +333,18 @@ fn options(set: &BTreeMap<&'static str, String>) -> Options {
     let kinds = get("kind");
     Options {
         tree: on("tree"),
+        detailed: on("detailed"),
         json: on("json"),
         caches: on("caches"),
         dry_run: set.get("dry-run").map(|v| v == "true" || v == "1"),
-        caution: on("include-caution"),
+        upto: match get("upto").as_str() {
+            "safe" => Safety::Safe,
+            "caution" => Safety::Caution,
+            "unsafe" => Safety::Unsafe,
+            other => fail(format!("bad -upto {other:?}: use safe, caution or unsafe")),
+        },
         rm: on("rm"),
+        yes: on("y"),
         volumes: on("volumes"),
         images: on("images"),
         by_image: get("group") == "image",
@@ -333,6 +361,7 @@ fn options(set: &BTreeMap<&'static str, String>) -> Options {
                 "bad -group {other:?}: use project, kind, safety or image"
             )),
         },
+        scoped: false,
         raw: ["older", "kind", "min"]
             .into_iter()
             .map(|n| (n, get(n)))
@@ -369,7 +398,7 @@ pub fn run(registry: &Registry) {
     if clean {
         args.remove(0);
     }
-    let Args { set, dirs } = match parse_args(&args) {
+    let Args { set, mut dirs } = match parse_args(&args) {
         Ok(parsed) => parsed,
         Err(ArgError::Help) => usage(false),
         Err(ArgError::Unknown(flag)) => {
@@ -378,7 +407,11 @@ pub fn run(registry: &Registry) {
         }
         Err(ArgError::Invalid(why)) => fail(why),
     };
-    let o = options(&set);
+    let mut o = options(&set);
+    if set.contains_key("pwd") {
+        dirs.push(".".to_owned());
+    }
+    o.scoped = !dirs.is_empty();
     let roots = resolve_roots(&dirs);
     if clean && let Err(why) = clean::preflight(&roots) {
         fail(why);
@@ -432,9 +465,12 @@ fn gather(
         let sections = s.sections();
         let flagged = sections.iter().any(|sec| o.flag_on(sec.flag));
         if only || clean {
-            flagged || (clean && sections.iter().any(|sec| sec.listed && sec.flag.is_none()))
+            flagged
+                || (clean
+                    && !o.scoped
+                    && sections.iter().any(|sec| sec.listed && sec.flag.is_none()))
         } else {
-            flagged || s.by_default()
+            flagged || (s.by_default() && !o.scoped)
         }
     };
     std::thread::scope(|scope| {
@@ -590,10 +626,10 @@ fn print_listing(roots: &[PathBuf], all: &[Artifact], shown: &[&Artifact], o: &O
             (true, Some(by @ (Group::Kind | Group::Safety))) => {
                 for (name, members) in groups(root, &under, by, o.order) {
                     println!("{}", group_heading(by, &name, &members));
-                    print_tree(root, &members);
+                    print_tree(root, &members, o.detailed);
                 }
             }
-            (true, _) => print_tree(root, &under),
+            (true, _) => print_tree(root, &under, o.detailed),
             (false, group) => print_list(root, &under, group, o.order),
         }
     }
@@ -731,7 +767,7 @@ mod tests {
         let parse =
             |args: &[&str]| parse_args(&args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>());
         assert_eq!(parse(&["--dry-run"]).unwrap().set["dry-run"], "true");
-        assert_eq!(parse(&["--include-caution", "-rm"]).unwrap().set.len(), 2);
+        assert_eq!(parse(&["--dry-run", "-rm"]).unwrap().set.len(), 2);
         assert_eq!(
             parse(&["-dry-run"]).unwrap_err(),
             ArgError::Invalid("-dry-run is written --dry-run".into())
@@ -748,6 +784,11 @@ mod tests {
     fn retired_flags_are_refused() {
         let parse = |arg: &str| parse_args(&[arg.to_owned()]);
         assert_eq!(parse("-yes").unwrap_err(), ArgError::Unknown("-yes".into()));
+        assert_eq!(
+            parse("--include-caution").unwrap_err(),
+            ArgError::Unknown("--include-caution".into())
+        );
+        assert_eq!(parse("-y").unwrap().set["y"], "true");
         assert_eq!(
             parse("-reverse").unwrap_err(),
             ArgError::Unknown("-reverse".into())
