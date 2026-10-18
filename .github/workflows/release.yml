@@ -1,20 +1,40 @@
 name: Release
 
-# Pushing a tag like v0.2.0 builds devsweep for macOS and Linux, publishes a GitHub release with the changelog's
-# notes for that version, and, when the HOMEBREW_TAP_TOKEN secret is set, updates the formula in
-# thearyanahmed/homebrew-tap.
+# Pushing a tag like v0.2.0, or running this workflow by hand from the Actions tab with that tag, builds devsweep
+# for macOS and Linux, publishes a GitHub release with the changelog's notes for that version, and, when the
+# HOMEBREW_TAP_TOKEN secret is set, updates the formula in thearyanahmed/homebrew-tap. Run by hand, the tag is
+# created on the commit the workflow runs from.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release, like v0.2.0; must match the version in Cargo.toml"
+        required: true
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag matches Cargo.toml and has no release yet
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          test "$TAG" = "v$version" || { echo "tag $TAG does not match Cargo.toml version $version"; exit 1; }
+          ! gh release view "$TAG" >/dev/null 2>&1 || { echo "release $TAG already exists"; exit 1; }
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   build:
+    needs: check
     name: build (${{ matrix.target }})
     strategy:
       fail-fast: true
@@ -34,7 +54,7 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          name="devsweep-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="devsweep-${TAG}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/devsweep" README.md LICENSE-MIT LICENSE-APACHE "$name/"
           tar czf "$name.tar.gz" "$name"
@@ -55,10 +75,10 @@ jobs:
           merge-multiple: true
       - name: Notes from the changelog
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${TAG#v}"
           awk -v v="$version" 'index($0, "## [" v "]") == 1 {on = 1; next} /^## \[/ {on = 0} on' CHANGELOG.md > notes.md
           test -s notes.md || { echo "CHANGELOG.md has no section for $version"; exit 1; }
-      - run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md
+      - run: gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -76,9 +96,9 @@ jobs:
       - name: Update the tap
         if: env.TAP_TOKEN != ''
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          base="https://github.com/thearyanahmed/devsweep/releases/download/${GITHUB_REF_NAME}"
-          sha() { cut -d' ' -f1 "dist/devsweep-${GITHUB_REF_NAME}-$1.tar.gz.sha256"; }
+          version="${TAG#v}"
+          base="https://github.com/thearyanahmed/devsweep/releases/download/${TAG}"
+          sha() { cut -d' ' -f1 "dist/devsweep-${TAG}-$1.tar.gz.sha256"; }
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/thearyanahmed/homebrew-tap" tap
           mkdir -p tap/Formula
           cat > tap/Formula/devsweep.rb <<EOF
@@ -90,22 +110,22 @@ jobs:
 
             on_macos do
               on_arm do
-                url "${base}/devsweep-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz"
+                url "${base}/devsweep-${TAG}-aarch64-apple-darwin.tar.gz"
                 sha256 "$(sha aarch64-apple-darwin)"
               end
               on_intel do
-                url "${base}/devsweep-${GITHUB_REF_NAME}-x86_64-apple-darwin.tar.gz"
+                url "${base}/devsweep-${TAG}-x86_64-apple-darwin.tar.gz"
                 sha256 "$(sha x86_64-apple-darwin)"
               end
             end
 
             on_linux do
               on_arm do
-                url "${base}/devsweep-${GITHUB_REF_NAME}-aarch64-unknown-linux-gnu.tar.gz"
+                url "${base}/devsweep-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
                 sha256 "$(sha aarch64-unknown-linux-gnu)"
               end
               on_intel do
-                url "${base}/devsweep-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+                url "${base}/devsweep-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
                 sha256 "$(sha x86_64-unknown-linux-gnu)"
               end
             end
