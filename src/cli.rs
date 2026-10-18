@@ -704,9 +704,9 @@ mod tests {
 
     #[test]
     fn parses_ages_and_sizes() {
-        assert_eq!(parse_age("2w").unwrap(), Duration::from_hours(336));
-        assert_eq!(parse_age("1mo").unwrap(), Duration::from_hours(720));
-        assert_eq!(parse_age("12h").unwrap(), Duration::from_hours(12));
+        assert_eq!(parse_age("2w").unwrap(), Duration::from_secs(336 * 3600));
+        assert_eq!(parse_age("1mo").unwrap(), Duration::from_secs(720 * 3600));
+        assert_eq!(parse_age("12h").unwrap(), Duration::from_secs(12 * 3600));
         assert!(parse_age("5m").is_err());
         assert_eq!(parse_size("100M").unwrap(), 100 << 20);
         assert_eq!(parse_size("1GiB").unwrap(), 1 << 30);

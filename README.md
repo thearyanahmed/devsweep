@@ -16,7 +16,13 @@ SIZE       SAFETY   KIND  PROJECT                          DIR           LAST BU
 
 ## Install
 
-Needs a Rust toolchain. macOS or Linux; Docker is optional.
+Needs Rust 1.88 or newer. macOS or Linux; Docker is optional.
+
+```sh
+cargo install --git https://github.com/thearyanahmed/devsweep
+```
+
+From a checkout:
 
 ```sh
 make install    # cargo install --path .: a release build in ~/.cargo/bin
@@ -232,3 +238,18 @@ make test    # clippy with every lint as an error, then the tests
 The lints are strict and live in `Cargo.toml` and `clippy.toml`: clippy's `pedantic`, `nursery` and `cargo` groups and a
 set of `restriction` lints are all errors, as are dead code and anything unused. `#[allow]` isn't permitted; an
 exception is an `#[expect(…, reason = "…")]` that says why.
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the rest: how to propose a change, add a sweeper, and what CI checks.
+Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as
+defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

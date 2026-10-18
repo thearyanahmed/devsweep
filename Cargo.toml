@@ -2,7 +2,16 @@
 name = "devsweep"
 version = "0.1.0"
 edition = "2024"
+# Let chains need 1.88; CI builds and tests on it.
+rust-version = "1.88"
 description = "What your projects' build output is costing you, and cleaning it up"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/thearyanahmed/devsweep"
+readme = "README.md"
+keywords = ["disk", "cleanup", "cargo", "node-modules", "docker"]
+categories = ["command-line-utilities", "development-tools", "filesystem"]
+exclude = ["/.github", "/Makefile"]
+# Not on crates.io yet; drop this line to publish.
 publish = false
 
 [dependencies]
@@ -36,8 +45,6 @@ all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
-# Not published to crates.io: no license, keywords or categories to declare.
-cargo_common_metadata = "allow"
 # Contradicts rustc's unreachable_pub, which this crate keeps: internal items say pub(crate), so plain pub marks the
 # public API.
 redundant_pub_crate = "allow"
