@@ -16,7 +16,7 @@ use std::process;
 use std::time::{Duration, SystemTime};
 
 use output::{
-    Group, Order, SortBy, ago, bold, dim, group_heading, groups, human, plural, print_caches,
+    Group, Order, ago, bold, dim, group_heading, groups, human, plural, print_caches,
     print_docker_by_image, print_images, print_list, print_tree, print_volumes, reset,
     safety_label, summary, tilde,
 };
@@ -93,11 +93,11 @@ const FLAGS: &[Flag] = &[
         "rm",
         "clean: also rm -rf artifacts and caches no tool has a clean command for (node_modules, .next, ...)",
     ),
-    flag(
-        "reverse",
-        "reverse the order: smallest, most recently built or Z to A first",
+    string(
+        "sort",
+        "size",
+        "size, age or path, each its natural way round; add :asc or :desc to choose, e.g. size:asc",
     ),
-    string("sort", "size", "sort by size, age or path"),
     flag("tree", "show a tree instead of a table"),
     flag(
         "volumes",
@@ -320,15 +320,7 @@ fn options(set: &BTreeMap<&'static str, String>) -> Options {
         older: (!older.is_empty()).then(|| parse_age(&older).unwrap_or_else(|e| fail(e))),
         min: parse_size(&get("min")).unwrap_or_else(|e| fail(e)),
         kinds: (!kinds.is_empty()).then(|| kinds.split(',').map(|k| k.trim().to_owned()).collect()),
-        order: Order {
-            by: match get("sort").as_str() {
-                "size" => SortBy::Size,
-                "age" => SortBy::Age,
-                "path" => SortBy::Path,
-                other => fail(format!("bad -sort {other:?}: use size, age or path")),
-            },
-            reverse: on("reverse"),
-        },
+        order: Order::parse(&get("sort")).unwrap_or_else(|e| fail(e)),
         group: match get("group").as_str() {
             "" | "image" => None,
             "project" => Some(Group::Project),
@@ -656,5 +648,15 @@ mod tests {
             ArgError::Unknown("-nope".into())
         );
         assert_eq!(parse(&["--help"]).unwrap_err(), ArgError::Help);
+    }
+
+    #[test]
+    fn retired_flags_are_refused() {
+        let parse = |arg: &str| parse_args(&[arg.to_owned()]);
+        assert_eq!(parse("-yes").unwrap_err(), ArgError::Unknown("-yes".into()));
+        assert_eq!(
+            parse("-reverse").unwrap_err(),
+            ArgError::Unknown("-reverse".into())
+        );
     }
 }

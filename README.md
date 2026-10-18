@@ -30,7 +30,7 @@ devsweep                          # everything under ~/dev, then Docker's images
 devsweep ~/dev ~/work             # other folders, any number
 devsweep -tree                    # the same as a tree of folders
 devsweep -group kind              # grouped: project, kind, safety, or image (Docker)
-devsweep -sort age -reverse       # most recently built first; -sort size or path
+devsweep -sort age:asc            # most recently built first; size, age, path, :asc or :desc
 devsweep -older 30d -kind rust    # only Rust projects not built for a month
 devsweep -caches                  # also the shared caches: cargo, go, npm, pnpm, brew, ...
 devsweep -images -volumes         # only Docker
@@ -145,8 +145,8 @@ the tool's own command where it has one:
 - **`-group project|kind|safety|image`**: a heading per group with its count and total, the rows under it, and the
   column the heading already says left out. Groups follow `-sort`; safety groups always go safe, caution, unsafe.
   `-tree` with `-group kind` or `safety` draws a tree per group (the tree already groups by project).
-- **`-sort size|age|path`** and **`-reverse`**: biggest, longest unbuilt or A to Z first, or the other way round. Rows
-  inside groups and the groups themselves both follow it.
+- **`-sort size|age|path`**: biggest, longest unbuilt or A to Z first. Add `:asc` or `:desc` for the other way round
+  (`size:asc` is smallest first, `path:desc` Z to A). Rows inside groups and the groups themselves both follow it.
 - **`-min`** (default 1M), **`-older`**, **`-kind`** filter; a line under the summary says how many artifacts they
   hid and why, so an empty result isn't a mystery.
 - **`-json`**: artifacts, roots, Docker's images, containers and volumes, and with `-caches` the caches.
@@ -166,9 +166,8 @@ Output is colored on a terminal and plain otherwise, or with `NO_COLOR` set.
 | `-kind` | only these kinds, comma separated: `rust,node,go,python,swift,zig,elixir,cmake` |
 | `-min` | hide artifacts smaller than this, e.g. `100M`, `1G` (default `1M`) |
 | `-older` | only artifacts not built for this long, e.g. `14d`, `3w`, `2mo`, `12h` |
-| `-reverse` | reverse the order |
 | `-rm` | clean: also offer what only rm -rf removes (`node_modules`, `.next`, ...) |
-| `-sort` | `size` (default), `age` or `path` |
+| `-sort` | `size` (default), `age` or `path`, optionally with `:asc` or `:desc` |
 | `-tree` | a tree instead of a table |
 | `-volumes` | only Docker volumes; with clean, offer each one |
 

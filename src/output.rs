@@ -226,25 +226,49 @@ fn method(a: &Artifact) -> String {
     }
 }
 
-/// What -sort orders by.
+/// What -sort orders by, each with its natural direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortBy {
-    /// The most to free first.
+    /// Descending: the most to free first.
     Size,
-    /// The longest unbuilt first.
+    /// Descending: the longest unbuilt first.
     Age,
-    /// A to Z.
+    /// Ascending: A to Z.
     Path,
 }
 
-/// -sort, and whether -reverse turns it around.
-#[derive(Debug, Clone, Copy)]
+/// -sort: what to order by, and whether :asc or :desc turned it away from its natural direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Order {
     pub by: SortBy,
     pub reverse: bool,
 }
 
 impl Order {
+    /// Reads -sort: `size`, `age` or `path`, optionally with `:asc` or `:desc`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let bad =
+            || format!("bad -sort {s:?}: use size, age or path, optionally with :asc or :desc");
+        let (name, direction) = s.split_once(':').map_or((s, None), |(n, d)| (n, Some(d)));
+        // Each order's natural direction: whether it reads descending.
+        let (by, descending) = match name {
+            "size" => (SortBy::Size, true),
+            "age" => (SortBy::Age, true),
+            "path" => (SortBy::Path, false),
+            _ => return Err(bad()),
+        };
+        let wants_descending = match direction {
+            None => descending,
+            Some("desc") => true,
+            Some("asc") => false,
+            Some(_) => return Err(bad()),
+        };
+        Ok(Self {
+            by,
+            reverse: wants_descending != descending,
+        })
+    }
+
     /// Sorts artifacts in this order.
     pub fn sort(self, arts: &mut [&Artifact]) {
         match self.by {
@@ -276,7 +300,7 @@ impl Group {
     }
 }
 
-/// The artifacts under each group, keeping their order within it. Groups follow -sort and -reverse too: by their total
+/// The artifacts under each group, keeping their order within it. Groups follow -sort too, direction included: by their total
 /// size, their longest unbuilt artifact, or their name. Safety groups keep their own order instead: safe, caution,
 /// unsafe.
 pub fn groups<'a>(
@@ -650,5 +674,91 @@ mod tests {
     fn width_skips_color_codes() {
         assert_eq!(width("\x1b[32msafe\x1b[0m"), 4);
         assert_eq!(width("└── a"), 5);
+    }
+
+    /// An artifact at /dev/<path>, of `mib` MiB, built `hours` ago.
+    fn artifact(path: &str, kind: &'static str, mib: u64, hours: u64, safety: Safety) -> Artifact {
+        let path = PathBuf::from("/dev").join(path);
+        Artifact {
+            project: path.parent().unwrap().to_path_buf(),
+            dir: path.file_name().unwrap().to_string_lossy().into_owned(),
+            path,
+            kind,
+            bytes: mib << 20,
+            shared: 0,
+            files: 1,
+            last_built: Some(SystemTime::now() - std::time::Duration::from_secs(hours * 3600)),
+            safety,
+            why: String::new(),
+            rebuild: String::new(),
+            clean: None,
+        }
+    }
+
+    fn order(s: &str) -> Order {
+        Order::parse(s).unwrap()
+    }
+
+    #[test]
+    fn sort_reads_a_direction() {
+        let o = |by, reverse| Order { by, reverse };
+        assert_eq!(order("size"), o(SortBy::Size, false));
+        assert_eq!(order("size:desc"), o(SortBy::Size, false));
+        assert_eq!(order("size:asc"), o(SortBy::Size, true));
+        assert_eq!(order("age"), o(SortBy::Age, false));
+        assert_eq!(order("age:asc"), o(SortBy::Age, true));
+        assert_eq!(order("path"), o(SortBy::Path, false));
+        assert_eq!(order("path:asc"), o(SortBy::Path, false));
+        assert_eq!(order("path:desc"), o(SortBy::Path, true));
+        for bad in ["name", "size:up", "size:", ":asc", ""] {
+            assert!(Order::parse(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn sort_orders_rows() {
+        let all = [
+            artifact("b/target", "rust", 30, 5, Safety::Safe),
+            artifact("a/node_modules", "node", 10, 1, Safety::Safe),
+            artifact("c/target", "rust", 20, 9, Safety::Safe),
+        ];
+        let names = |s: &str| {
+            let mut arts: Vec<&Artifact> = all.iter().collect();
+            order(s).sort(&mut arts);
+            arts.iter()
+                .map(|a| rel(Path::new("/dev"), &a.project))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("size"), ["b", "c", "a"]);
+        assert_eq!(names("size:asc"), ["a", "c", "b"]);
+        assert_eq!(names("age"), ["c", "b", "a"]);
+        assert_eq!(names("age:asc"), ["a", "b", "c"]);
+        assert_eq!(names("path"), ["a", "b", "c"]);
+        assert_eq!(names("path:desc"), ["c", "b", "a"]);
+    }
+
+    #[test]
+    fn groups_follow_the_sort_but_safety_keeps_its_order() {
+        let all = [
+            artifact("a/target", "rust", 30, 1, Safety::Safe),
+            artifact("b/target", "rust", 30, 1, Safety::Unsafe),
+            artifact("c/node_modules", "node", 50, 1, Safety::Caution),
+        ];
+        let arts: Vec<&Artifact> = all.iter().collect();
+        let keys = |by, s: &str| {
+            groups(Path::new("/dev"), &arts, by, order(s))
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>()
+        };
+        // rust has 60 MiB in all, node 50.
+        assert_eq!(keys(Group::Kind, "size"), ["rust", "node"]);
+        assert_eq!(keys(Group::Kind, "size:asc"), ["node", "rust"]);
+        assert_eq!(keys(Group::Kind, "path"), ["node", "rust"]);
+        assert_eq!(keys(Group::Safety, "size"), ["safe", "caution", "unsafe"]);
+        assert_eq!(
+            keys(Group::Safety, "size:asc"),
+            ["safe", "caution", "unsafe"]
+        );
     }
 }
