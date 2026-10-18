@@ -341,7 +341,7 @@ public API.
   "shared" when some of its links live outside the artifact, since deleting the artifact doesn't free it.
 - **Speed**: every artifact's folders go onto one queue that all cores work through, so a single huge `node_modules`
   is spread across them. The git checks, the cache sizes and the Docker query run at the same time as the scan.
-  `~/dev` with 57,000 files takes about 80 ms.
+  A whole home folder, the default, takes about 0.4 s.
 - **Git**: `git ls-files` and `git check-ignore` in the project decide whether an artifact is tracked or ignored.
 
 ## Development
