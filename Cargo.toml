@@ -27,6 +27,8 @@ trivial_numeric_casts = "deny"
 let_underscore_drop = "deny"
 redundant_lifetimes = "deny"
 missing_debug_implementations = "deny"
+missing_docs = "deny"
+unreachable_pub = "deny"
 
 [lints.clippy]
 # Every opinionated group, as errors.
@@ -36,6 +38,9 @@ nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
 # Not published to crates.io: no license, keywords or categories to declare.
 cargo_common_metadata = "allow"
+# Contradicts rustc's unreachable_pub, which this crate keeps: internal items say pub(crate), so plain pub marks the
+# public API.
+redundant_pub_crate = "allow"
 
 # Chosen from the restriction group.
 allow_attributes = "deny"                 # #[expect] instead: it fails once the lint no longer fires

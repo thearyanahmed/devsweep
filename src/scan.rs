@@ -11,49 +11,76 @@ use std::time::SystemTime;
 use serde::{Serialize, Serializer};
 
 use crate::output::plural;
-use crate::rules::{self, Safety, exists};
+use crate::sweep::{Clean, Registry, Safety, exists};
 
 /// One directory of build output that some project claims.
 #[derive(Debug, Serialize)]
 pub struct Artifact {
+    /// The folder itself.
     pub path: PathBuf,
+    /// The project it belongs to: the folder holding it.
     pub project: PathBuf,
-    pub kind: &'static str,
+    /// The sweeper that claimed it: `rust`, `node`.
+    pub kind: String,
+    /// Its name: `target`.
     pub dir: String,
     /// Disk space used.
     pub bytes: u64,
     /// Part of `bytes` in hard links also used elsewhere (pnpm store): not freed by deleting.
     #[serde(rename = "shared_bytes")]
     pub shared: u64,
+    /// Files in it, a hard-linked one counted once.
     pub files: u64,
+    /// When anything in it last changed.
     #[serde(serialize_with = "rfc3339")]
     pub last_built: Option<SystemTime>,
+    /// How safe removing it is, after git had its say.
     pub safety: Safety,
+    /// Why it isn't safe, when it isn't.
     pub why: String,
+    /// The command that recreates it.
     pub rebuild: String,
-    /// The tool's own command, run in `project`; `None` means only rm -rf removes it.
-    #[serde(rename = "clean_cmd")]
-    pub clean: Option<Vec<String>>,
+    /// How it's removed. In JSON, `clean_cmd`: the tool's command, or null when only rm -rf removes it.
+    #[serde(rename = "clean_cmd", serialize_with = "clean_cmd")]
+    pub clean: Clean,
+}
+
+fn clean_cmd<S: Serializer>(clean: &Clean, s: S) -> Result<S::Ok, S::Error> {
+    match clean {
+        Clean::Tool(argv) => argv.serialize(s),
+        Clean::RemoveDir | Clean::Blocked(_) => s.serialize_none(),
+    }
 }
 
 impl Artifact {
     /// What deleting the artifact gives back.
+    #[must_use]
     pub const fn freed(&self) -> u64 {
         self.bytes - self.shared
     }
 
     /// How clean removes the artifact, for display.
+    #[must_use]
     pub fn method(&self) -> String {
-        self.clean
-            .as_ref()
-            .map_or_else(|| format!("rm -rf {}", self.dir), |argv| argv.join(" "))
+        match &self.clean {
+            Clean::Tool(argv) => argv.join(" "),
+            Clean::RemoveDir => format!("rm -rf {}", self.dir),
+            Clean::Blocked(why) => format!("blocked: {why}"),
+        }
     }
 }
 
-pub fn scan(roots: &[PathBuf]) -> Vec<Artifact> {
+/// Every folder under `roots` that a sweeper in `registry` claims, measured and checked against git, in the order
+/// the walk met them.
+///
+/// # Panics
+///
+/// Only if one of its own worker threads panicked, which is a bug.
+#[must_use]
+pub fn scan(roots: &[PathBuf], registry: &Registry) -> Vec<Artifact> {
     let mut found = Vec::new();
     for root in roots {
-        find(root, &mut found);
+        find(root, registry, &mut found);
     }
 
     // Measuring is most of the time (node_modules has tens of thousands of files), and the git checks are
@@ -106,7 +133,7 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
 }
 
 /// Walks `dir` in name order, collecting artifacts without descending into them.
-fn find(dir: &Path, found: &mut Vec<Artifact>) {
+fn find(dir: &Path, registry: &Registry, found: &mut Vec<Artifact>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return; // unreadable: skip, don't abort the scan
     };
@@ -121,31 +148,29 @@ fn find(dir: &Path, found: &mut Vec<Artifact>) {
             continue;
         }
         let path = e.path();
-        let Some(r) = rules::find(&path, dir, &name) else {
-            find(&path, found);
+        let Some((kind, claim)) = registry.claim(&path, dir, &name) else {
+            find(&path, registry, found);
             continue;
         };
-        let (rebuild, safety, why) = r.rebuild.resolve(dir);
-        let clean = r.clean.resolve(dir, &name);
         found.push(Artifact {
             path,
             project: dir.to_path_buf(),
-            kind: r.kind,
+            kind: kind.to_owned(),
             dir: name,
             bytes: 0,
             shared: 0,
             files: 0,
             last_built: None,
-            safety: r.safety.max(safety),
-            why,
-            rebuild,
-            clean,
+            safety: claim.safety,
+            why: claim.why,
+            rebuild: claim.rebuild,
+            clean: claim.clean,
         });
     }
 }
 
 #[derive(Default)]
-pub struct Measure {
+pub(crate) struct Measure {
     pub bytes: u64,
     pub shared: u64,
     pub files: u64,
@@ -153,7 +178,7 @@ pub struct Measure {
 }
 
 /// Size, file count and newest modification time of one directory tree.
-pub fn measure(root: &Path) -> Measure {
+pub(crate) fn measure(root: &Path) -> Measure {
     measure_all(&[root]).pop().unwrap_or_default()
 }
 
@@ -271,7 +296,7 @@ impl DirQueue {
 /// Measures several trees at once with one pool of threads sharing a queue of directories, so a single huge tree
 /// (`node_modules`) is spread over every core too. A hard-linked file counts once, and counts as shared only when some
 /// of its links live outside its tree (deleting the tree doesn't free it then).
-pub fn measure_all(roots: &[&Path]) -> Vec<Measure> {
+pub(crate) fn measure_all(roots: &[&Path]) -> Vec<Measure> {
     let queue = DirQueue::new(roots);
     let partials: Vec<Vec<Partial>> = thread::scope(|s| {
         let handles: Vec<_> = (0..workers())
@@ -470,7 +495,7 @@ mod tests {
         // A directory named target with no Cargo.toml is not claimed.
         write("docs/target/notes.md", "keep me");
 
-        let got: HashMap<String, Safety> = scan(std::slice::from_ref(&root))
+        let got: HashMap<String, Safety> = scan(std::slice::from_ref(&root), &Registry::builtin())
             .into_iter()
             .map(|a| {
                 (

@@ -94,8 +94,16 @@ shows what it would delete:
 | `--dry-run` | only shown | only shown |
 | `--dry-run=false` | run | deletes |
 
-At the end it reports what was freed, measured again afterwards, and what was only shown. A command that fails doesn't
-count as freed.
+Every `rm -rf` waits for a step of its own at the end, after all the tools' commands: the folders are listed together
+with their sizes and asked about once. At the end devsweep reports what was freed, measured again afterwards, and
+what was only shown. A command that fails doesn't count as freed.
+
+Some things it refuses outright, whatever a sweeper says:
+
+- running `clean` as root or under `sudo`;
+- `/` or your home folder as a folder to scan;
+- an `rm -rf` of anything but a real folder (not a symlink) strictly inside a scanned folder or your home folder,
+  never one of those itself, checked again right before deleting.
 
 ## Docker
 
@@ -170,6 +178,41 @@ Output is colored on a terminal and plain otherwise, or with `NO_COLOR` set.
 | `-sort` | `size` (default), `age` or `path`, optionally with `:asc` or `:desc` |
 | `-tree` | a tree instead of a table |
 | `-volumes` | only Docker volumes; with clean, offer each one |
+
+## Adding your own
+
+devsweep is a library with a thin binary on top. Everything it knows goes through one trait, `Sweeper`: the built-in
+Rust, Node and Docker support are sweepers like any other. To teach it something new, write a small binary of your own:
+
+```rust
+use devsweep::sweep::{Registry, SimpleSweeper};
+
+fn main() {
+    let mut registry = Registry::builtin();
+    registry.add(
+        SimpleSweeper::new("gradle")
+            .folders(&["build", ".gradle"])
+            .markers(&["build.gradle", "build.gradle.kts"])
+            .clean(&["./gradlew", "clean"])
+            .rebuild("./gradlew build"),
+    );
+    devsweep::cli::run(&registry);
+}
+```
+
+`SimpleSweeper` covers "folders with these names, beside one of these files, cleaned and rebuilt by these commands".
+For anything smarter, implement `Sweeper` yourself:
+
+- `dirs` and `claim` for folders met while walking: say whether a folder is yours, how safe removing it is, how it's
+  cleaned (`Clean::Tool`, `Clean::RemoveDir` or `Clean::Blocked`) and rebuilt.
+- `list` and `sections` for things found on their own, outside any project (a cache, Docker's images): return
+  `Item`s, and describe the table they're listed in.
+
+The engine does the rest: walking, measuring, rendering, asking before cleaning, and the safety net, which a sweeper
+can't switch off. Git-tracked files make a folder unsafe whatever the sweeper says, a folder git doesn't ignore is at
+least caution, and `rm -rf` stays a dry run unless `--dry-run=false`. The first registered sweeper to claim a folder
+keeps it, so the built-ins can't be overridden by accident. `tests/custom_sweeper.rs` shows each of these through the
+public API.
 
 ## How it works
 

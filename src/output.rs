@@ -4,10 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
-use crate::caches::Cache;
-use crate::docker::{Container, Image, Removable, Snapshot, User, Volume};
-use crate::rules::Safety;
 use crate::scan::Artifact;
+use crate::sweep::{Clean, Item, Safety, Section, User};
 
 fn color() -> bool {
     static COLOR: OnceLock<bool> = OnceLock::new();
@@ -16,7 +14,7 @@ fn color() -> bool {
     })
 }
 
-pub fn paint(code: &str, s: &str) -> String {
+pub(crate) fn paint(code: &str, s: &str) -> String {
     if color() {
         format!("\x1b[{code}m{s}\x1b[0m")
     } else {
@@ -25,19 +23,19 @@ pub fn paint(code: &str, s: &str) -> String {
 }
 
 /// Clears whatever styling the terminal was left in, when writing in color.
-pub fn reset() -> &'static str {
+pub(crate) fn reset() -> &'static str {
     if color() { "\x1b[0m" } else { "" }
 }
 
-pub fn dim(s: &str) -> String {
+pub(crate) fn dim(s: &str) -> String {
     paint("2", s)
 }
 
-pub fn bold(s: &str) -> String {
+pub(crate) fn bold(s: &str) -> String {
     paint("1", s)
 }
 
-pub fn safety_label(s: Safety) -> String {
+pub(crate) fn safety_label(s: Safety) -> String {
     let code = match s {
         Safety::Safe => "32",
         Safety::Caution => "33",
@@ -47,7 +45,7 @@ pub fn safety_label(s: Safety) -> String {
 }
 
 #[expect(clippy::cast_precision_loss, reason = "shown to one decimal place")]
-pub fn human(b: u64) -> String {
+pub(crate) fn human(b: u64) -> String {
     const UNIT: u64 = 1024;
     if b < UNIT {
         return format!("{b} B");
@@ -62,7 +60,7 @@ pub fn human(b: u64) -> String {
     format!("{:.1} {}iB", b as f64 / div as f64, b"KMGTPE"[exp] as char)
 }
 
-pub fn ago(t: Option<SystemTime>) -> String {
+pub(crate) fn ago(t: Option<SystemTime>) -> String {
     let Some(t) = t else {
         return "-".into();
     };
@@ -79,7 +77,7 @@ pub fn ago(t: Option<SystemTime>) -> String {
     }
 }
 
-pub fn plural(n: usize, word: &str) -> String {
+pub(crate) fn plural(n: usize, word: &str) -> String {
     if n == 1 {
         format!("1 {word}")
     } else {
@@ -88,7 +86,7 @@ pub fn plural(n: usize, word: &str) -> String {
 }
 
 /// Shortens a path under $HOME for display.
-pub fn tilde(p: &Path) -> String {
+pub(crate) fn tilde(p: &Path) -> String {
     if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty())
         && let Ok(rest) = p.strip_prefix(&home)
     {
@@ -101,7 +99,7 @@ pub fn tilde(p: &Path) -> String {
     p.display().to_string()
 }
 
-pub fn rel(root: &Path, p: &Path) -> String {
+pub(crate) fn rel(root: &Path, p: &Path) -> String {
     match p.strip_prefix(root) {
         Ok(r) if r.as_os_str().is_empty() => ".".into(),
         Ok(r) => r.display().to_string(),
@@ -109,7 +107,7 @@ pub fn rel(root: &Path, p: &Path) -> String {
     }
 }
 
-pub fn summary(roots: &[PathBuf], arts: &[&Artifact]) {
+pub(crate) fn summary(roots: &[PathBuf], arts: &[&Artifact]) {
     let mut by = [0u64; 3];
     let mut projects: Vec<&Path> = arts.iter().map(|a| a.project.as_path()).collect();
     projects.sort();
@@ -216,10 +214,9 @@ fn width(s: &str) -> usize {
     n
 }
 
-/// How clean removes an artifact; rm -rf stands out since it needs -rm.
 /// How clean removes an artifact: a tool's command dim like the other details, rm -rf in magenta since it needs -rm.
 fn method(a: &Artifact) -> String {
-    if a.clean.is_none() {
+    if a.clean == Clean::RemoveDir {
         paint("35", &a.method())
     } else {
         dim(&a.method())
@@ -228,7 +225,7 @@ fn method(a: &Artifact) -> String {
 
 /// What -sort orders by, each with its natural direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortBy {
+pub(crate) enum SortBy {
     /// Descending: the most to free first.
     Size,
     /// Descending: the longest unbuilt first.
@@ -239,14 +236,14 @@ pub enum SortBy {
 
 /// -sort: what to order by, and whether :asc or :desc turned it away from its natural direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Order {
+pub(crate) struct Order {
     pub by: SortBy,
     pub reverse: bool,
 }
 
 impl Order {
     /// Reads -sort: `size`, `age` or `path`, optionally with `:asc` or `:desc`.
-    pub fn parse(s: &str) -> Result<Self, String> {
+    pub(crate) fn parse(s: &str) -> Result<Self, String> {
         let bad =
             || format!("bad -sort {s:?}: use size, age or path, optionally with :asc or :desc");
         let (name, direction) = s.split_once(':').map_or((s, None), |(n, d)| (n, Some(d)));
@@ -270,7 +267,7 @@ impl Order {
     }
 
     /// Sorts artifacts in this order.
-    pub fn sort(self, arts: &mut [&Artifact]) {
+    pub(crate) fn sort(self, arts: &mut [&Artifact]) {
         match self.by {
             SortBy::Size => arts.sort_by_key(|a| std::cmp::Reverse(a.freed())),
             SortBy::Age => arts.sort_by_key(|a| a.last_built),
@@ -284,7 +281,7 @@ impl Order {
 
 /// What -group puts each artifact under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Group {
+pub(crate) enum Group {
     Project,
     Kind,
     Safety,
@@ -294,7 +291,7 @@ impl Group {
     fn key(self, root: &Path, a: &Artifact) -> String {
         match self {
             Self::Project => rel(root, &a.project),
-            Self::Kind => a.kind.to_owned(),
+            Self::Kind => a.kind.clone(),
             Self::Safety => a.safety.as_str().to_owned(),
         }
     }
@@ -303,7 +300,7 @@ impl Group {
 /// The artifacts under each group, keeping their order within it. Groups follow -sort too, direction included: by their total
 /// size, their longest unbuilt artifact, or their name. Safety groups keep their own order instead: safe, caution,
 /// unsafe.
-pub fn groups<'a>(
+pub(crate) fn groups<'a>(
     root: &Path,
     arts: &[&'a Artifact],
     by: Group,
@@ -336,7 +333,7 @@ pub fn groups<'a>(
 }
 
 /// A group's heading: its name, in its safety's color when grouped by safety, then how much is in it.
-pub fn group_heading(by: Group, name: &str, members: &[&Artifact]) -> String {
+pub(crate) fn group_heading(by: Group, name: &str, members: &[&Artifact]) -> String {
     let total: u64 = members.iter().map(|a| a.freed()).sum();
     let title = match members.first() {
         Some(a) if by == Group::Safety => bold(&safety_label(a.safety)),
@@ -353,7 +350,7 @@ pub fn group_heading(by: Group, name: &str, members: &[&Artifact]) -> String {
     )
 }
 
-pub fn print_list(root: &Path, arts: &[&Artifact], group: Option<Group>, order: Order) {
+pub(crate) fn print_list(root: &Path, arts: &[&Artifact], group: Option<Group>, order: Order) {
     const COLS: [&str; 8] = [
         "SIZE",
         "SAFETY",
@@ -399,7 +396,7 @@ pub fn print_list(root: &Path, arts: &[&Artifact], group: Option<Group>, order: 
             t.row(keep(vec![
                 size,
                 safety_label(a.safety),
-                a.kind.into(),
+                a.kind.clone(),
                 rel(root, &a.project),
                 a.dir.clone(),
                 dim(&ago(a.last_built)),
@@ -429,7 +426,7 @@ struct Node<'a> {
 }
 
 /// The artifacts as a tree of the folders under `root`, which the lines above have already named.
-pub fn print_tree(root: &Path, arts: &[&Artifact]) {
+pub(crate) fn print_tree(root: &Path, arts: &[&Artifact]) {
     let mut top = Node::default();
     for a in arts {
         let mut n = &mut top;
@@ -483,33 +480,6 @@ fn walk_tree(n: &Node<'_>, prefix: &str) {
     }
 }
 
-pub fn print_caches(cs: &mut [Cache]) {
-    cs.sort_by_key(|c| std::cmp::Reverse(c.bytes));
-    let total: u64 = cs.iter().map(|c| c.bytes).sum();
-    println!(
-        "\n{}  {}  {}",
-        bold("Shared caches"),
-        human(total),
-        dim("(refilled on demand; devsweep clean -caches offers each one)")
-    );
-    let mut t = Table::new(&["SIZE", "SAFETY", "CACHE", "PATH", "CLEAN WITH"], 0);
-    for c in cs.iter() {
-        let path = if c.path.as_os_str().is_empty() {
-            "-".into()
-        } else {
-            tilde(&c.path)
-        };
-        t.row(vec![
-            human(c.bytes),
-            safety_label(c.safety),
-            c.name.into(),
-            path,
-            dim(&format!("{}{}", c.method(), notes(c.note))),
-        ]);
-    }
-    t.print();
-}
-
 /// The containers using something, each with its state.
 fn users(used_by: &[User]) -> String {
     if used_by.is_empty() {
@@ -528,128 +498,119 @@ fn users(used_by: &[User]) -> String {
         .join(", ")
 }
 
-/// How to remove it, or what's in the way.
-fn clean_with(r: &impl Removable) -> String {
-    dim(&r
-        .clean_cmd()
-        .map_or_else(|| r.blocker(), |argv| argv.join(" ")))
+/// How an item is removed: the tool's command, rm -rf of its folder, or what's in the way.
+pub(crate) fn item_method(i: &Item) -> String {
+    match &i.clean {
+        Clean::Tool(argv) => argv.join(" "),
+        Clean::RemoveDir => format!(
+            "rm -rf {}",
+            i.path.as_deref().map(tilde).unwrap_or_default()
+        ),
+        Clean::Blocked(why) => why.clone(),
+    }
 }
 
-/// An image's own size, and the layers it shares with other images, which removing it doesn't free.
-fn image_size(i: &Image) -> String {
+/// An item's own size, and what it shares with others, which removing it doesn't free.
+fn item_size(i: &Item) -> String {
+    let bytes = human(i.bytes.unwrap_or(0));
     if i.shared > 0 {
-        format!(
-            "{}{}",
-            human(i.bytes),
-            dim(&format!(" +{} shared", human(i.shared)))
-        )
+        format!("{bytes}{}", dim(&format!(" +{} shared", human(i.shared))))
     } else {
-        human(i.bytes)
+        bytes
     }
 }
 
-/// Docker's images: who uses each, and whether removing it is wise.
-pub fn print_images(images: &[Image]) {
-    let total: u64 = images.iter().map(|i| i.bytes).sum();
-    println!(
-        "{}  {}  {}",
-        bold("Docker images"),
-        human(total),
-        dim("(shared layers counted once; devsweep clean -images offers each one)")
-    );
-    let mut t = Table::new(&["SIZE", "SAFETY", "IMAGE", "USED BY", "CLEAN WITH"], 0);
-    for i in images {
-        t.row(vec![
-            image_size(i),
-            safety_label(i.safety),
-            i.name.clone(),
-            users(&i.used_by),
-            clean_with(i),
-        ]);
+/// One section's items as a table under its heading.
+pub(crate) fn print_section(sec: &Section, items: &[&Item], title: &str) {
+    let total: u64 = items.iter().filter_map(|i| i.bytes).sum();
+    println!("{}  {}  {}", bold(title), human(total), dim(sec.note));
+    let mut cols = vec!["SIZE", "SAFETY", sec.noun];
+    if sec.paths {
+        cols.push("PATH");
     }
-    t.print();
-}
-
-/// Docker's volumes: who uses each, and whether removing it is wise.
-pub fn print_volumes(volumes: &[&Volume], title: &str) {
-    let total: u64 = volumes.iter().map(|v| v.bytes).sum();
-    println!(
-        "{}  {}  {}",
-        bold(title),
-        human(total),
-        dim("(data containers wrote; devsweep clean -volumes offers each one)")
-    );
-    let mut t = Table::new(&["SIZE", "SAFETY", "VOLUME", "USED BY", "CLEAN WITH"], 0);
-    for v in volumes {
-        t.row(vec![
-            human(v.bytes),
-            safety_label(v.safety),
-            v.name.clone(),
-            users(&v.used_by),
-            clean_with(*v),
-        ]);
+    if sec.users {
+        cols.push("USED BY");
+    }
+    cols.push("CLEAN WITH");
+    let mut t = Table::new(&cols, 0);
+    for i in items {
+        let mut row = vec![item_size(i), safety_label(i.safety), i.label.clone()];
+        if sec.paths {
+            row.push(i.path.as_deref().map_or_else(|| "-".into(), tilde));
+        }
+        if sec.users {
+            row.push(users(&i.used_by));
+        }
+        row.push(dim(&format!("{}{}", item_method(i), notes(&i.note))));
+        t.row(row);
     }
     t.print();
 }
 
-/// Docker arranged by image: each image, the containers made from it, and the volumes those use. Volumes no container
-/// uses follow on their own.
-pub fn print_docker_by_image(d: &Snapshot) {
-    let volume_size = |name: &str| {
-        d.volumes
-            .iter()
-            .find(|v| v.name == name)
-            .map_or(0, |v| v.bytes)
+/// What `-group image` shows: a section's items with what was made from them.
+#[derive(Debug)]
+pub(crate) struct Family<'a> {
+    /// The parents' section: Docker images.
+    pub parents: &'a Section,
+    /// The children's section: Docker containers.
+    pub children: &'a Section,
+    /// The section of what the children use: Docker volumes.
+    pub uses: Option<&'a Section>,
+}
+
+/// Each parent, then the children made from it with their state, size and what they use.
+pub(crate) fn print_by_parent(f: &Family<'_>, parents: &[&Item], children: &[&Item], all: &[Item]) {
+    let size_of = |id: &str| {
+        all.iter()
+            .find(|i| i.id == id)
+            .and_then(|i| i.bytes)
+            .unwrap_or(0)
     };
-    let mut t = Table::new(&["CONTAINER", "STATE", "SIZE", "VOLUMES"], 2);
-    for i in &d.images {
-        let shown = if i.name == "<none>" {
-            i.id.as_str()
-        } else {
-            i.name.as_str()
-        };
-        let made: Vec<&Container> = d.containers.iter().filter(|c| c.image == shown).collect();
+    let uses_noun = f
+        .uses
+        .map_or_else(|| "USES".to_owned(), |u| format!("{}S", u.noun));
+    let mut t = Table::new(&[f.children.noun, "STATE", "SIZE", &uses_noun], 2);
+    for p in parents {
+        let made: Vec<&&Item> = children
+            .iter()
+            .filter(|c| c.parent.as_deref() == Some(p.id.as_str()))
+            .collect();
         let about = if made.is_empty() {
-            i.why.clone()
+            p.why.clone()
         } else {
-            plural(made.len(), "container")
+            plural(made.len(), &f.children.noun.to_lowercase())
         };
         t.line(format!(
             "{}  {}  {}  {}",
-            bold(shown),
-            image_size(i),
-            safety_label(i.safety),
+            bold(&p.id),
+            item_size(p),
+            safety_label(p.safety),
             dim(&about)
         ));
         for c in made {
-            let volumes = c
-                .volumes
+            let uses = c
+                .uses
                 .iter()
-                .map(|v| format!("{v} {}", dim(&human(volume_size(v)))))
+                .map(|u| format!("{u} {}", dim(&human(size_of(u)))))
                 .collect::<Vec<_>>()
                 .join(", ");
             t.row(vec![
-                c.name.clone(),
-                dim(if c.running { "running" } else { "stopped" }),
-                human(c.bytes),
-                if volumes.is_empty() {
-                    dim("-")
+                c.label.clone(),
+                dim(if c.running == Some(true) {
+                    "running"
                 } else {
-                    volumes
-                },
+                    "stopped"
+                }),
+                human(c.bytes.unwrap_or(0)),
+                if uses.is_empty() { dim("-") } else { uses },
             ]);
         }
     }
-    println!("{}", bold("Docker by image"));
+    println!("{}", bold(f.parents.grouped_title));
     t.print();
-    let loose: Vec<&Volume> = d.volumes.iter().filter(|v| v.used_by.is_empty()).collect();
-    if !loose.is_empty() {
-        println!();
-        print_volumes(&loose, "Docker volumes no container uses");
-    }
 }
 
-pub fn notes(n: &str) -> String {
+pub(crate) fn notes(n: &str) -> String {
     if n.is_empty() {
         String::new()
     } else {
@@ -683,7 +644,7 @@ mod tests {
             project: path.parent().unwrap().to_path_buf(),
             dir: path.file_name().unwrap().to_string_lossy().into_owned(),
             path,
-            kind,
+            kind: kind.to_owned(),
             bytes: mib << 20,
             shared: 0,
             files: 1,
@@ -691,7 +652,7 @@ mod tests {
             safety,
             why: String::new(),
             rebuild: String::new(),
-            clean: None,
+            clean: Clean::RemoveDir,
         }
     }
 

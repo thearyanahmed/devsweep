@@ -10,25 +10,18 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::cmd::{on_path, output};
-use crate::rules::Safety;
+use crate::sweep::{Clean, Item, Safety, Section, Sweeper, User};
 
 /// Everything Docker reported, from one `docker system df --verbose`.
 #[derive(Debug, Default, Serialize)]
-pub struct Snapshot {
+pub(super) struct Snapshot {
     pub images: Vec<Image>,
     pub containers: Vec<Container>,
     pub volumes: Vec<Volume>,
 }
 
-/// A container, by name, and whether it's running.
-#[derive(Debug, Clone, Serialize)]
-pub struct User {
-    pub name: String,
-    pub running: bool,
-}
-
 #[derive(Debug, Serialize)]
-pub struct Container {
+pub(super) struct Container {
     pub name: String,
     pub running: bool,
     /// The image's name, or its short ID once no tag points to it.
@@ -39,7 +32,7 @@ pub struct Container {
 }
 
 #[derive(Debug, Serialize)]
-pub struct Image {
+pub(super) struct Image {
     /// The ID's first 12 hex digits, as `docker images` shows it.
     pub id: String,
     /// repository:tag, or `<none>` for a dangling image.
@@ -54,91 +47,12 @@ pub struct Image {
 }
 
 #[derive(Debug, Serialize)]
-pub struct Volume {
+pub(super) struct Volume {
     pub name: String,
     pub bytes: u64,
     pub used_by: Vec<User>,
     pub safety: Safety,
     pub why: String,
-}
-
-/// An image or a volume: something Docker removes only once no container uses it, even a stopped one.
-pub trait Removable {
-    fn label(&self) -> &str;
-    fn bytes(&self) -> u64;
-    fn why(&self) -> &str;
-    fn used_by(&self) -> &[User];
-    fn safety(&self) -> Safety;
-    /// Docker's command for removing it.
-    fn remove_cmd(&self) -> Vec<String>;
-
-    /// The command, once nothing is in the way.
-    fn clean_cmd(&self) -> Option<Vec<String>> {
-        self.used_by().is_empty().then(|| self.remove_cmd())
-    }
-
-    /// What has to go first: the containers using it, stopping the running ones.
-    fn blocker(&self) -> String {
-        let names: Vec<&str> = self.used_by().iter().map(|c| c.name.as_str()).collect();
-        if self.safety() == Safety::Unsafe {
-            format!("stop and remove {} first", names.join(", "))
-        } else {
-            format!("docker rm {} first", names.join(" "))
-        }
-    }
-}
-
-impl Removable for Image {
-    fn label(&self) -> &str {
-        &self.name
-    }
-    fn bytes(&self) -> u64 {
-        self.bytes
-    }
-    fn why(&self) -> &str {
-        &self.why
-    }
-    fn used_by(&self) -> &[User] {
-        &self.used_by
-    }
-    fn safety(&self) -> Safety {
-        self.safety
-    }
-    fn remove_cmd(&self) -> Vec<String> {
-        // A dangling image has no name to give.
-        let target = if self.name == "<none>" {
-            &self.id
-        } else {
-            &self.name
-        };
-        vec!["docker".into(), "image".into(), "rm".into(), target.clone()]
-    }
-}
-
-impl Removable for Volume {
-    fn label(&self) -> &str {
-        &self.name
-    }
-    fn bytes(&self) -> u64 {
-        self.bytes
-    }
-    fn why(&self) -> &str {
-        &self.why
-    }
-    fn used_by(&self) -> &[User] {
-        &self.used_by
-    }
-    fn safety(&self) -> Safety {
-        self.safety
-    }
-    fn remove_cmd(&self) -> Vec<String> {
-        vec![
-            "docker".into(),
-            "volume".into(),
-            "rm".into(),
-            self.name.clone(),
-        ]
-    }
 }
 
 /// `docker args`, giving up after a few seconds: a stopped Docker Desktop can leave the command hanging.
@@ -153,14 +67,14 @@ fn docker(args: &'static [&'static str]) -> Option<String> {
 }
 
 /// What `docker system df` says `docker system prune` could reclaim; 0 when Docker isn't running.
-pub fn reclaimable() -> u64 {
+pub(super) fn reclaimable() -> u64 {
     docker(&["system", "df", "--format", "{{.Reclaimable}}"])
         .map_or(0, |out| out.lines().filter_map(|l| size(l.trim())).sum())
 }
 
 /// Docker's images, containers and volumes, each biggest first (then by name). Empty when Docker isn't installed or
 /// running.
-pub fn snapshot() -> Snapshot {
+pub(super) fn snapshot() -> Snapshot {
     docker(&["system", "df", "--verbose", "--format", "json"])
         .and_then(|out| serde_json::from_str::<Value>(&out).ok())
         .map_or_else(Snapshot::default, |df| from_df(&df))
@@ -397,24 +311,157 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let s = from_df(&df);
-        let image = |name: &str| s.images.iter().find(|i| i.name == name).unwrap();
-        assert_eq!(image("app:1").safety, Safety::Unsafe);
-        // The old container refers to the dangling image by ID.
-        assert_eq!(image("<none>").safety, Safety::Caution);
+        let items = items(from_df(&df));
+        let item = |kind: &str, label: &str| {
+            items
+                .iter()
+                .find(|i| i.kind == kind && i.label == label)
+                .unwrap()
+        };
+        let tool = |argv: &[&str]| Clean::Tool(argv.iter().map(|a| (*a).to_owned()).collect());
+        assert_eq!(item(IMAGE, "app:1").safety, Safety::Unsafe);
         assert_eq!(
-            image("<none>").remove_cmd(),
-            ["docker", "image", "rm", "33a0a17c27cb"]
+            item(IMAGE, "app:1").clean,
+            Clean::Blocked("stop and remove api first".into())
         );
-        assert_eq!(image("unused:1").safety, Safety::Caution);
+        // The old container refers to the dangling image by ID; it's in the way of removing it.
+        let dangling = item(IMAGE, "<none>");
+        assert_eq!(dangling.id, "33a0a17c27cb");
+        assert_eq!(dangling.safety, Safety::Caution);
+        assert_eq!(dangling.clean, Clean::Blocked("docker rm old first".into()));
         assert_eq!(
-            image("unused:1").clean_cmd().unwrap(),
-            ["docker", "image", "rm", "unused:1"]
+            item(IMAGE, "unused:1").clean,
+            tool(&["docker", "image", "rm", "unused:1"])
         );
-        assert_eq!(s.containers[0].name, "old");
-        assert_eq!(s.containers[0].image, "33a0a17c27cb");
-        assert_eq!(s.volumes[0].safety, Safety::Unsafe);
-        assert_eq!(s.volumes[1].used_by.len(), 0);
-        assert!(s.volumes[0].clean_cmd().is_none());
+        let old = item(CONTAINER, "old");
+        assert_eq!(old.parent.as_deref(), Some("33a0a17c27cb"));
+        assert_eq!(item(CONTAINER, "api").uses, ["data"]);
+        assert_eq!(item(VOLUME, "data").safety, Safety::Unsafe);
+        assert_eq!(
+            item(VOLUME, "spare").clean,
+            tool(&["docker", "volume", "rm", "spare"])
+        );
     }
+}
+
+/// Docker's images, containers and volumes, as items. Containers only show under their image, with `-group image`.
+#[derive(Debug)]
+pub(super) struct Docker;
+
+const IMAGE: &str = "docker image";
+const CONTAINER: &str = "docker container";
+const VOLUME: &str = "docker volume";
+
+impl Sweeper for Docker {
+    fn name(&self) -> &'static str {
+        "docker"
+    }
+
+    fn sections(&self) -> Vec<Section> {
+        vec![
+            Section {
+                kind: IMAGE,
+                title: "Docker images",
+                noun: "IMAGE",
+                note: "(shared layers counted once; devsweep clean -images offers each one)",
+                paths: false,
+                users: true,
+                listed: true,
+                flag: Some("images"),
+                unused_title: "",
+                grouped_title: "Docker by image",
+            },
+            Section {
+                kind: CONTAINER,
+                title: "Docker containers",
+                noun: "CONTAINER",
+                note: "",
+                paths: false,
+                users: false,
+                listed: false,
+                flag: None,
+                unused_title: "",
+                grouped_title: "",
+            },
+            Section {
+                kind: VOLUME,
+                title: "Docker volumes",
+                noun: "VOLUME",
+                note: "(data containers wrote; devsweep clean -volumes offers each one)",
+                paths: false,
+                users: true,
+                listed: true,
+                flag: Some("volumes"),
+                unused_title: "Docker volumes no container uses",
+                grouped_title: "",
+            },
+        ]
+    }
+
+    fn list(&self) -> Vec<Item> {
+        items(snapshot())
+    }
+}
+
+/// A snapshot's images, containers and volumes, as items.
+fn items(s: Snapshot) -> Vec<Item> {
+    let images = s.images.into_iter().map(|i| {
+        let id = display_name(&i.id, &i.name);
+        removable(Item {
+            id,
+            bytes: Some(i.bytes),
+            shared: i.shared,
+            safety: i.safety,
+            why: i.why,
+            used_by: i.used_by,
+            ..Item::new(IMAGE, &i.name, Clean::Tool(Vec::new()))
+        })
+    });
+    let containers = s.containers.into_iter().map(|c| Item {
+        bytes: Some(c.bytes),
+        running: Some(c.running),
+        parent: Some(c.image),
+        uses: c.volumes,
+        ..Item::new(
+            CONTAINER,
+            &c.name,
+            Clean::Blocked("devsweep never removes a container".into()),
+        )
+    });
+    let volumes = s.volumes.into_iter().map(|v| {
+        removable(Item {
+            bytes: Some(v.bytes),
+            safety: v.safety,
+            why: v.why,
+            used_by: v.used_by,
+            ..Item::new(VOLUME, &v.name, Clean::Tool(Vec::new()))
+        })
+    });
+    images.chain(containers).chain(volumes).collect()
+}
+
+/// Sets how an image or volume is removed: Docker's command once no container uses it, which Docker insists on even
+/// for a stopped one; until then, the containers in the way.
+fn removable(mut item: Item) -> Item {
+    item.clean = if item.used_by.is_empty() {
+        let what = if item.kind == IMAGE {
+            "image"
+        } else {
+            "volume"
+        };
+        Clean::Tool(vec![
+            "docker".into(),
+            what.into(),
+            "rm".into(),
+            item.id.clone(),
+        ])
+    } else {
+        let names: Vec<&str> = item.used_by.iter().map(|c| c.name.as_str()).collect();
+        Clean::Blocked(if item.safety == Safety::Unsafe {
+            format!("stop and remove {} first", names.join(", "))
+        } else {
+            format!("docker rm {} first", names.join(" "))
+        })
+    };
+    item
 }

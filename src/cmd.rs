@@ -3,7 +3,7 @@
 use std::process::{Command, Stdio};
 
 /// What `cmd args` prints, trimmed; `None` when it fails, prints nothing, or isn't installed.
-pub fn output(cmd: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn output(cmd: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(cmd)
         .args(args)
         .stderr(Stdio::null())
@@ -14,7 +14,7 @@ pub fn output(cmd: &str, args: &[&str]) -> Option<String> {
 }
 
 /// Whether `cmd` is an executable on PATH.
-pub fn on_path(cmd: &str) -> bool {
+pub(crate) fn on_path(cmd: &str) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|d| {

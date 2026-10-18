@@ -3,13 +3,11 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::Options;
-use crate::caches::Cache;
+use crate::cli::Options;
 use crate::cmd::on_path;
-use crate::docker::{Removable, Snapshot};
-use crate::output::{bold, dim, human, paint, plural, rel, tilde};
-use crate::rules::{Safety, exists};
+use crate::output::{bold, dim, human, item_method, paint, plural, rel, tilde};
 use crate::scan::{Artifact, measure};
+use crate::sweep::{Clean, Item, Safety, Section, exists};
 
 /// One thing clean will do: a tool command run in a directory, or an rm -rf.
 struct Job {
@@ -41,9 +39,10 @@ impl Job {
         format!(" {}", parts.join(" "))
     }
 
-    fn run(&self) -> Result<(), String> {
+    fn run(&self, bases: &[PathBuf]) -> Result<(), String> {
         if self.argv.is_empty() {
             for p in &self.paths {
+                removable(p, bases)?;
                 std::fs::remove_dir_all(p).map_err(|e| e.to_string())?;
             }
             return Ok(());
@@ -78,6 +77,8 @@ struct Plan<'a> {
     caution: Vec<&'a Artifact>,
     /// Tracked in git: never cleaned.
     tracked: Vec<&'a Artifact>,
+    /// A sweeper said they can't be removed now.
+    blocked: Vec<&'a Artifact>,
 }
 
 /// A clean command and the project it runs in.
@@ -100,7 +101,11 @@ fn plan<'a>(root: &Path, arts: &[&'a Artifact], o: &Options) -> Plan<'a> {
                 p.tracked.push(a);
                 continue;
             }
-            _ if a.clean.is_none() && !o.rm => {
+            _ if matches!(a.clean, Clean::Blocked(_)) => {
+                p.blocked.push(a);
+                continue;
+            }
+            _ if a.clean == Clean::RemoveDir && !o.rm => {
                 p.need_rm.push(a);
                 continue;
             }
@@ -111,7 +116,11 @@ fn plan<'a>(root: &Path, arts: &[&'a Artifact], o: &Options) -> Plan<'a> {
             Safety::Caution => false,
             Safety::Safe => true,
         };
-        if let Some(argv) = &a.clean
+        let argv = match &a.clean {
+            Clean::Tool(argv) => argv.clone(),
+            Clean::RemoveDir | Clean::Blocked(_) => Vec::new(),
+        };
+        if !argv.is_empty()
             && let Some(&Slot { in_batch, index }) = by_cmd.get(&(a.project.clone(), argv.clone()))
         {
             let j = if in_batch {
@@ -128,7 +137,7 @@ fn plan<'a>(root: &Path, arts: &[&'a Artifact], o: &Options) -> Plan<'a> {
         } else {
             &mut p.one_by_one
         };
-        if let Some(argv) = &a.clean {
+        if !argv.is_empty() {
             let slot = Slot {
                 in_batch: to_batch,
                 index: list.len(),
@@ -138,7 +147,7 @@ fn plan<'a>(root: &Path, arts: &[&'a Artifact], o: &Options) -> Plan<'a> {
         list.push(Job {
             label: rel(root, &a.path),
             dir: a.project.clone(),
-            argv: a.clean.clone().unwrap_or_default(),
+            argv,
             paths: vec![a.path.clone()],
             before: a.bytes,
         });
@@ -149,6 +158,8 @@ fn plan<'a>(root: &Path, arts: &[&'a Artifact], o: &Options) -> Plan<'a> {
 /// Runs jobs, or with --dry-run only says what it would run, and keeps the score.
 struct Runner {
     dry_run: Option<bool>,
+    /// The folders rm -rf may delete inside: the scanned roots and the home folder.
+    bases: Vec<PathBuf>,
     freed: u64,
     would_free: u64,
     /// An rm -rf was left as a dry run only because --dry-run wasn't given.
@@ -175,7 +186,7 @@ impl Runner {
             self.would_free += j.before;
             return;
         }
-        if let Err(e) = j.run() {
+        if let Err(e) = j.run(&self.bases) {
             eprintln!("  {} {}: {e}", paint("31", "failed"), j.label);
             self.failed = true;
             return;
@@ -191,32 +202,37 @@ impl Runner {
     }
 }
 
-pub fn run_clean(
+pub(crate) fn run_clean(
     roots: &[PathBuf],
     arts: &[&Artifact],
-    caches: &[Cache],
-    docker: &Snapshot,
+    offered: &[(Section, Vec<&Item>)],
     o: &Options,
 ) -> i32 {
     let root = &roots[0];
     let p = plan(root, arts, o);
     let mut runner = Runner {
         dry_run: o.dry_run,
+        bases: roots.iter().cloned().chain(home()).collect(),
         freed: 0,
         would_free: 0,
         rm_held_back: false,
         failed: false,
     };
 
-    if !p.batch.is_empty() {
-        let total: u64 = p.batch.iter().map(|j| j.before).sum();
+    // Every rm -rf waits for a step of its own at the end, after all the tools' own commands.
+    let (batch, mut rm): (Vec<&Job>, Vec<&Job>) = p.batch.iter().partition(|j| !j.argv.is_empty());
+    let (one_by_one, rm_caution): (Vec<&Job>, Vec<&Job>) =
+        p.one_by_one.iter().partition(|j| !j.argv.is_empty());
+    rm.extend(rm_caution);
+    if !batch.is_empty() {
+        let total: u64 = batch.iter().map(|j| j.before).sum();
         println!(
             "{}  {}, {}\n",
             paint("32", "Safe to clean"),
-            plural(p.batch.len(), "job"),
+            plural(batch.len(), "job"),
             human(total)
         );
-        for j in &p.batch {
+        for j in &batch {
             println!(
                 "  {:<10}  {}  {}",
                 human(j.before),
@@ -224,14 +240,16 @@ pub fn run_clean(
                 dim(&format!("via {}{}", j.method(), j.rm_target()))
             );
         }
-        let question = format!("\nRun these {} ({})?", p.batch.len(), human(total));
-        if p.batch.iter().all(|j| runner.dry(j)) || ask(&question) {
-            p.batch.iter().for_each(|j| runner.run(j));
+        let question = format!("\nRun {} ({})?", plural(batch.len(), "job"), human(total));
+        if batch.iter().all(|j| runner.dry(j)) || ask(&question) {
+            for j in &batch {
+                runner.run(j);
+            }
         }
     }
-    if !p.one_by_one.is_empty() {
+    if !one_by_one.is_empty() {
         println!("\n{}  asked one by one", paint("33", "Caution"));
-        for j in &p.one_by_one {
+        for j in &one_by_one {
             let question = format!(
                 "{}{}  {} ({})?",
                 j.method(),
@@ -244,14 +262,13 @@ pub fn run_clean(
             }
         }
     }
-    if !caches.is_empty() {
-        clean_caches(caches, o, &mut runner);
+    let mut rm_items = Vec::new();
+    for (sec, items) in offered {
+        clean_items(sec, items, o, &mut runner, &mut rm_items);
     }
-    if o.images && !docker.images.is_empty() {
-        clean_removable("Docker images", &docker.images, &mut runner);
-    }
-    if o.volumes && !docker.volumes.is_empty() {
-        clean_removable("Docker volumes", &docker.volumes, &mut runner);
+    rm.extend(rm_items.iter());
+    if !rm.is_empty() {
+        remove_dirs(&rm, &mut runner);
     }
     report_left_alone(root, &p);
 
@@ -271,76 +288,160 @@ pub fn run_clean(
     i32::from(runner.failed)
 }
 
-/// Offers each shared cache in turn.
-fn clean_caches(caches: &[Cache], o: &Options, runner: &mut Runner) {
-    println!("\n{}  asked one by one", bold("Shared caches"));
-    for c in caches {
-        if c.cmd.is_none() && !o.rm {
-            let why = format!("(no clean command; -rm to rm -rf {})", tilde(&c.path));
-            println!("  {}  {}  {}", dim("skipped"), c.name, dim(&why));
-            continue;
-        }
-        let argv = c.cmd.clone().unwrap_or_default();
-        let j = Job {
-            label: c.name.into(),
-            dir: if argv.is_empty() {
-                c.path.clone()
-            } else {
-                PathBuf::new()
+/// Offers a section's items one by one. Ones a sweeper says are blocked are only named, with what's in the way; ones
+/// only rm -rf removes wait for -rm.
+fn clean_items(
+    sec: &Section,
+    items: &[&Item],
+    o: &Options,
+    runner: &mut Runner,
+    rm: &mut Vec<Job>,
+) {
+    println!("\n{}  asked one by one", bold(sec.title));
+    for i in items {
+        let path = i.path.clone();
+        let (argv, dir) = match &i.clean {
+            Clean::Blocked(blocker) => {
+                let why = format!("({}: {blocker})", i.why);
+                println!("  {}  {}  {}", dim("skipped"), i.label, dim(&why));
+                continue;
+            }
+            Clean::RemoveDir if !o.rm => {
+                let why = format!(
+                    "(no clean command; -rm to rm -rf {})",
+                    path.as_deref().map(tilde).unwrap_or_default()
+                );
+                println!("  {}  {}  {}", dim("skipped"), i.label, dim(&why));
+                continue;
+            }
+            // rm -rf removes the item's own folder and nothing else.
+            Clean::RemoveDir => match &path {
+                Some(p) => (Vec::new(), p.clone()),
+                None => continue,
             },
-            paths: if c.path.as_os_str().is_empty() {
-                vec![]
-            } else {
-                vec![c.path.clone()]
-            },
-            argv,
-            before: c.bytes,
+            Clean::Tool(argv) => (argv.clone(), PathBuf::new()),
         };
-        let note = if c.note.is_empty() {
+        let j = Job {
+            label: i.label.clone(),
+            dir,
+            argv,
+            paths: path.into_iter().collect(),
+            before: i.bytes.unwrap_or(0),
+        };
+        let extra = if i.note.is_empty() { &i.why } else { &i.note };
+        let extra = if extra.is_empty() {
             String::new()
         } else {
-            dim(&format!("  {}", c.note))
+            dim(&format!("  {extra}"))
         };
         let question = format!(
-            "{}  {} {}?{note}",
-            c.name,
-            human(c.bytes),
-            dim(&format!("via {}", c.method()))
+            "{}  {} {}?{extra}",
+            i.label,
+            human(j.before),
+            dim(&format!("via {}", item_method(i)))
         );
-        if runner.dry(&j) || ask(&question) {
+        if j.argv.is_empty() {
+            rm.push(j);
+        } else if runner.dry(&j) || ask(&question) {
             runner.run(&j);
         }
     }
 }
 
-/// Offers each Docker image or volume no container uses, one by one. Docker won't remove the others, so they're only
-/// named, with what stands in the way.
-fn clean_removable<R: Removable>(title: &str, items: &[R], runner: &mut Runner) {
-    println!("\n{}  asked one by one", bold(title));
-    for r in items {
-        let Some(argv) = r.clean_cmd() else {
-            let why = format!("({}: {})", r.why(), r.blocker());
-            println!("  {}  {}  {}", dim("skipped"), r.label(), dim(&why));
-            continue;
-        };
-        let j = Job {
-            label: r.label().to_owned(),
-            dir: PathBuf::new(),
-            argv,
-            paths: vec![],
-            before: r.bytes(),
-        };
-        let question = format!(
-            "{}  {} {}?{}",
-            r.label(),
-            human(r.bytes()),
-            dim(&format!("via {}", j.method())),
-            dim(&format!("  {}", r.why()))
-        );
-        if runner.dry(&j) || ask(&question) {
-            runner.run(&j);
+/// The last step: every folder only rm -rf removes, listed together and asked about once. Without --dry-run=false it
+/// only shows what it would delete.
+fn remove_dirs(jobs: &[&Job], runner: &mut Runner) {
+    let total: u64 = jobs.iter().map(|j| j.before).sum();
+    println!(
+        "\n{}  {}, {}  {}",
+        paint("35", "rm -rf"),
+        plural(jobs.len(), "folder"),
+        human(total),
+        dim("(no tool removes these)")
+    );
+    if jobs.iter().all(|j| runner.dry(j)) {
+        for j in jobs {
+            runner.run(j);
+        }
+        return;
+    }
+    for j in jobs {
+        println!("  {:<10}  {}", human(j.before), dim(j.rm_target().trim()));
+    }
+    let question = format!(
+        "\nDelete {} for good ({})?",
+        plural(jobs.len(), "folder"),
+        human(total)
+    );
+    if ask(&question) {
+        for j in jobs {
+            runner.run(j);
         }
     }
+}
+
+/// Whether rm -rf may delete `path`: a real folder, not a symlink, named without `..`, strictly inside one of `bases`
+/// and none of them itself, nor `/` or the home folder. Checked right before deleting, whatever claimed it.
+fn removable(path: &Path, bases: &[PathBuf]) -> Result<(), String> {
+    let shown = path.display();
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(format!(
+            "refusing to rm -rf {shown}: not a plain absolute path"
+        ));
+    }
+    let home = home();
+    let mut protected = bases
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(home.as_deref())
+        .chain([Path::new("/")]);
+    if protected.any(|p| p == path) {
+        return Err(format!(
+            "refusing to rm -rf {shown}: it's a root, not something inside one"
+        ));
+    }
+    if !bases.iter().any(|b| path.starts_with(b)) {
+        return Err(format!(
+            "refusing to rm -rf {shown}: it's outside the scanned folders and the home folder"
+        ));
+    }
+    let md =
+        std::fs::symlink_metadata(path).map_err(|e| format!("refusing to rm -rf {shown}: {e}"))?;
+    if md.file_type().is_symlink() || !md.is_dir() {
+        return Err(format!("refusing to rm -rf {shown}: not a real folder"));
+    }
+    Ok(())
+}
+
+/// The home folder, when there is one.
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Refuses to clean as root, or with `/` or the home folder itself as a folder to scan.
+pub(crate) fn preflight(roots: &[PathBuf]) -> Result<(), String> {
+    let root_user = std::env::var_os("SUDO_UID").is_some()
+        || crate::cmd::output("id", &["-u"]).is_some_and(|uid| uid == "0");
+    if root_user {
+        return Err("refusing to clean as root (or under sudo): run it as yourself".into());
+    }
+    let home = home();
+    if let Some(r) = roots
+        .iter()
+        .find(|r| r.as_path() == Path::new("/") || Some(*r) == home.as_ref())
+    {
+        return Err(format!(
+            "refusing to clean with {} as a folder to scan: name the folders that hold your projects",
+            r.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Says what clean didn't touch, and the flag that would change that.
@@ -371,6 +472,14 @@ fn report_left_alone(root: &Path, p: &Plan<'_>) {
             plural(p.tracked.len(), "artifact")
         );
     }
+    for a in &p.blocked {
+        println!(
+            "\n{}  {}  {}",
+            dim("Blocked"),
+            rel(root, &a.path),
+            dim(&a.method())
+        );
+    }
 }
 
 fn size_of(paths: &[PathBuf]) -> u64 {
@@ -394,4 +503,52 @@ fn prompt(q: &str) -> io::Result<bool> {
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
     Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rm_rf_refuses_anything_but_a_real_folder_inside_a_root() {
+        let base = std::env::temp_dir().join(format!("devsweep-rm-{}", std::process::id()));
+        let inside = base.join("app/node_modules");
+        fs_create(&inside);
+        let outside = std::env::temp_dir().join(format!("devsweep-rm-out-{}", std::process::id()));
+        fs_create(&outside);
+        let link = base.join("app/link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let bases = vec![base.clone()];
+
+        assert!(removable(&inside, &bases).is_ok());
+        let refused = |p: &Path| removable(p, &bases).unwrap_err();
+        assert!(refused(&base).contains("root"), "the scanned folder itself");
+        assert!(refused(Path::new("/")).contains("root"));
+        assert!(refused(&outside).contains("outside"));
+        assert!(
+            refused(&link).contains("not a real folder"),
+            "a symlink, even to a folder"
+        );
+        assert!(refused(&base.join("app/../app/node_modules")).contains("plain"));
+        assert!(
+            refused(Path::new("app/node_modules")).contains("plain"),
+            "a relative path"
+        );
+        assert!(refused(&base.join("app/missing")).contains("refusing"));
+
+        std::fs::remove_dir_all(&base).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn clean_refuses_slash_and_home_as_roots() {
+        assert!(preflight(&[PathBuf::from("/")]).is_err());
+        if let Some(home) = home() {
+            assert!(preflight(&[home.join("dev"), home]).is_err());
+        }
+    }
+
+    fn fs_create(p: &Path) {
+        std::fs::create_dir_all(p).unwrap();
+    }
 }

@@ -3,15 +3,14 @@ use std::thread;
 
 use serde::Serialize;
 
+use super::docker;
 use crate::cmd::{on_path, output};
-use crate::docker;
-use crate::output::tilde;
-use crate::rules::{Safety, exists};
 use crate::scan::measure_all;
+use crate::sweep::{Clean, Item, Safety, Section, Sweeper, exists};
 
 /// A shared, tool-wide cache outside any project.
 #[derive(Debug, Serialize)]
-pub struct Cache {
+pub(super) struct Cache {
     pub name: &'static str,
     pub path: PathBuf,
     pub bytes: u64,
@@ -26,20 +25,6 @@ pub struct Cache {
     docker: bool,
 }
 
-impl Cache {
-    pub fn method(&self) -> String {
-        self.cmd.as_ref().map_or_else(
-            || format!("rm -rf {}", tilde(&self.path)),
-            |argv| argv.join(" "),
-        )
-    }
-
-    const fn note(mut self, note: &'static str) -> Self {
-        self.note = note;
-        self
-    }
-}
-
 fn cache(name: &'static str, path: PathBuf, cmd: &[&str]) -> Cache {
     Cache {
         name,
@@ -52,7 +37,14 @@ fn cache(name: &'static str, path: PathBuf, cmd: &[&str]) -> Cache {
     }
 }
 
-pub fn caches() -> Vec<Cache> {
+impl Cache {
+    const fn note(mut self, note: &'static str) -> Self {
+        self.note = note;
+        self
+    }
+}
+
+pub(super) fn caches() -> Vec<Cache> {
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     let h = |p: &str| home.join(p);
     let cargo_note = "cargo also trims it on its own";
@@ -138,4 +130,46 @@ fn pnpm_store(default: PathBuf) -> PathBuf {
     output("pnpm", &["store", "path"])
         .and_then(|p| Path::new(&p).parent().map(Path::to_path_buf))
         .unwrap_or(default)
+}
+
+/// The shared tool caches, listed only with `-caches`.
+#[derive(Debug)]
+pub(super) struct Caches;
+
+impl Sweeper for Caches {
+    fn name(&self) -> &'static str {
+        "caches"
+    }
+
+    fn by_default(&self) -> bool {
+        false
+    }
+
+    fn sections(&self) -> Vec<Section> {
+        vec![Section {
+            kind: "cache",
+            title: "Shared caches",
+            noun: "CACHE",
+            note: "(refilled on demand; devsweep clean -caches offers each one)",
+            paths: true,
+            users: false,
+            listed: true,
+            flag: Some("caches"),
+            unused_title: "",
+            grouped_title: "",
+        }]
+    }
+
+    fn list(&self) -> Vec<Item> {
+        caches()
+            .into_iter()
+            .map(|c| Item {
+                path: (!c.path.as_os_str().is_empty()).then_some(c.path),
+                bytes: Some(c.bytes),
+                safety: c.safety,
+                note: c.note.to_owned(),
+                ..Item::new("cache", c.name, c.cmd.map_or(Clean::RemoveDir, Clean::Tool))
+            })
+            .collect()
+    }
 }
