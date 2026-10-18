@@ -3,6 +3,8 @@
 
 mod caches;
 mod clean;
+mod cmd;
+mod docker;
 mod output;
 mod rules;
 mod scan;

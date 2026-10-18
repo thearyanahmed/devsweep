@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::Options;
-use crate::caches::{Cache, on_path};
+use crate::caches::Cache;
+use crate::cmd::on_path;
 use crate::output::{bold, dim, human, paint, plural, rel, tilde};
 use crate::rules::{Safety, exists};
 use crate::scan::{Artifact, measure};
