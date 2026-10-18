@@ -12,7 +12,12 @@ pub(super) fn register(r: &mut Registry) {
     );
     r.add(
         SimpleSweeper::new("cmake")
-            .folders(&["cmake-build-debug", "cmake-build-release"])
+            .folders(&[
+                "cmake-build-debug",
+                "cmake-build-release",
+                "cmake-build-relwithdebinfo",
+                "cmake-build-minsizerel",
+            ])
             .markers(&["CMakeLists.txt"])
             .clean(&clean)
             .rebuild("cmake --build"),

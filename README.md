@@ -62,9 +62,9 @@ A project is recognised by a folder name plus a marker beside it, so a `target/`
 | swift | `.build` | `swift package reset` | `swift build` |
 | zig | `.zig-cache`, `zig-cache`, `zig-out` | rm -rf | `zig build` |
 | elixir | `_build`, `deps` | `mix clean --deps`, `mix deps.clean --all` | `mix compile`, `mix deps.get` |
-| cmake | `build` (with a `CMakeCache.txt`), `cmake-build-*` | `cmake --build … --target clean` | `cmake --build` |
+| cmake | `build` (with a `CMakeCache.txt`), `cmake-build-debug`, `-release`, `-relwithdebinfo`, `-minsizerel` | `cmake --build … --target clean` | `cmake --build` |
 
-`src/rules.rs` holds this table; a new kind is one line there.
+Each kind is a sweeper in `src/builtin/`, one file per ecosystem; to add your own, see [Adding your own](#adding-your-own).
 
 ## Safety
 
@@ -171,7 +171,7 @@ Output is colored on a terminal and plain otherwise, or with `NO_COLOR` set.
 | `-group` | group by `project`, `kind` or `safety`; `image` arranges Docker by image |
 | `-images` | only Docker images; with clean, offer each one |
 | `-json` | print JSON |
-| `-kind` | only these kinds, comma separated: `rust,node,go,python,swift,zig,elixir,cmake` |
+| `-kind` | only these kinds, comma separated: `rust,node,go,python,swift,zig,elixir,cmake`, or any sweeper you add |
 | `-min` | hide artifacts smaller than this, e.g. `100M`, `1G` (default `1M`) |
 | `-older` | only artifacts not built for this long, e.g. `14d`, `3w`, `2mo`, `12h` |
 | `-rm` | clean: also offer what only rm -rf removes (`node_modules`, `.next`, ...) |

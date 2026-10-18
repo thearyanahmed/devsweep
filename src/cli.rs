@@ -68,7 +68,7 @@ const FLAGS: &[Flag] = &[
     string(
         "kind",
         "",
-        "only these kinds, comma separated: rust,node,go,python,swift,zig,elixir,cmake",
+        "only these kinds, comma separated: rust,node,go,python,swift,zig,elixir,cmake, or any sweeper added",
     ),
     string(
         "min",
