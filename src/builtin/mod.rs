@@ -4,6 +4,7 @@ mod caches;
 mod cmake;
 mod docker;
 mod elixir;
+mod git;
 mod go;
 mod models;
 mod node;
@@ -33,6 +34,7 @@ pub(crate) fn register(r: &mut Registry) {
     r.add(models::Models);
     r.add(caches::Caches);
     r.add(toolchains::Toolchains);
+    r.add(git::Git);
 }
 
 /// The VM disks of the Docker engines installed, for `devsweep why`.

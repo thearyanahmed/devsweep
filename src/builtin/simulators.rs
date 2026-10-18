@@ -1,11 +1,51 @@
-//! Xcode's simulator runtimes: 5 to 8 GB each, and every Xcode update adds one without removing the last.
+//! Xcode's simulator runtimes, 5 to 8 GB each, which every Xcode update adds to without removing the last; and old
+//! copies of Xcode itself, 10 to 15 GB each.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::cmd::output;
 use crate::sweep::{Clean, Item, Safety};
+
+/// Every Xcode in /Applications but the one `xcode-select` points to. They're outside the home folder, which is the
+/// only place devsweep deletes in, so they're listed with how to remove them rather than offered.
+pub(super) fn xcodes() -> Vec<Item> {
+    let Ok(apps) = std::fs::read_dir("/Applications") else {
+        return Vec::new();
+    };
+    let active = output("xcode-select", &["-p"]).unwrap_or_default();
+    let mut found: Vec<PathBuf> = apps
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy())
+                .is_some_and(|n| n.starts_with("Xcode") && n.ends_with(".app"))
+        })
+        .collect();
+    found.sort();
+    found
+        .into_iter()
+        .map(|app| {
+            let name = app
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let clean = if Path::new(&active).starts_with(&app) {
+                Clean::Blocked("the Xcode xcode-select points to".into())
+            } else {
+                Clean::Blocked("outside your home folder: move it to the Trash yourself".into())
+            };
+            Item {
+                path: Some(app),
+                safety: Safety::Caution,
+                ..Item::new("cache", &name.to_lowercase(), clean)
+            }
+        })
+        .collect()
+}
 
 /// One simulator runtime `xcrun simctl runtime list` knows.
 #[derive(Debug, PartialEq, Eq)]

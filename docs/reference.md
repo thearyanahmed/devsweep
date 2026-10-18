@@ -1,0 +1,347 @@
+# devsweep reference
+
+Everything devsweep does, in detail. The [README](../README.md) is the short version.
+
+[kondo](https://github.com/tbillington/kondo) and [npkill](https://github.com/voidcosmos/npkill) find build folders and
+delete them. devsweep goes further on what a developer's disk holds, and on not losing anything: git decides what's
+safe, each tool cleans its own output, and Docker, local models, toolchains and caches are covered too.
+
+## Usage
+
+```sh
+devsweep                          # your home folder, then Docker and local models
+devsweep ~/dev ~/work             # only these folders, any number; Docker left out
+devsweep -pwd                     # the folder you are in
+devsweep -tree                    # the same as a tree of folders: size, safety, clean command
+devsweep -tree -detailed          # the tree with kind, last build, rebuild command and why
+devsweep -group kind              # grouped: project, kind, safety, or image (Docker)
+devsweep -sort age:asc            # most recently built first; size, age, path, :asc or :desc
+devsweep -older 30d -kind rust    # only Rust projects not built for a month
+devsweep -caches                  # also the shared caches: cargo, go, npm, pnpm, brew, ...
+devsweep -images -volumes         # only Docker
+devsweep -models                  # only local AI models: Ollama, LM Studio
+devsweep -toolchains              # also old Rust, Node, Python and Java versions
+devsweep -clusters                # only local Kubernetes clusters: kind, k3d
+devsweep -git                     # also huge .git folders and orphaned worktrees
+devsweep -json                    # everything, for scripts
+
+devsweep why                      # where the disk went, on one screen
+
+devsweep clean --dry-run          # what clean would run, running nothing
+devsweep clean                    # runs the safe tool commands after one yes
+devsweep clean -pwd               # only the project or folder you are in
+devsweep clean -pwd -y            # the same, answering yes to every question
+devsweep clean -caches -images    # also offers caches and Docker images, one by one
+devsweep clean -upto caution      # also caution artifacts (dist/, no lockfile), one by one
+devsweep clean -until 30G         # only enough to leave 30 GiB free, safest and longest unbuilt first
+devsweep clean -trim 30d          # Rust: drop only build files unused for 30 days (cargo-sweep)
+```
+
+With no folders named, devsweep scans your home folder, wherever your projects are: `~/dev`, `~/Desktop`, a repo
+cloned into `~/Downloads` and forgotten. It skips what holds no projects: `~/Library`, the hidden folders at the top of
+home (tools' own state; `-caches` covers their caches), `~/Applications`, `~/Music`, `~/Movies`, `~/Pictures`,
+`~/Public` and Photos libraries. A folder you name must exist and be readable, or devsweep stops and says which and
+why. On macOS your terminal may first need access to `~/Desktop`, `~/Documents` and `~/Downloads` (System Settings >
+Privacy & Security); a folder it can't read is skipped.
+
+Flags go before or after the folders. One-word flags take one dash (`-tree`), several words two (`--dry-run`); a
+one-word flag also takes two. `-h` lists them all.
+
+## What it finds
+
+A project is recognised by a folder name plus a marker beside it, so a `target/` without a `Cargo.toml` is left alone.
+
+| Kind | Folders | Cleaned with | Recreated with |
+| --- | --- | --- | --- |
+| rust | `target` | `cargo clean` | `cargo build` |
+| node | `node_modules` | rm -rf | the lockfile's install: `pnpm install`, `npm ci`, `yarn install`, `bun install` |
+| node | `.next`, `.svelte-kit`, `.turbo`, `.parcel-cache`, `.vite` | rm -rf | the framework's build or dev server |
+| node | `.nuxt`, `.angular` | `npx nuxi cleanup`, `npx ng cache clean` | the framework's build |
+| node | `dist`, `build`, `out`, `release` | the project's `clean` script, else rm -rf | the project's build script |
+| go | `vendor` | rm -rf | `go mod vendor` |
+| python | `.venv`, `venv` | rm -rf | `uv sync`, `poetry install`, `pipenv install` or `pip install -r requirements.txt` |
+| python | `.tox`, `.nox`, `.pytest_cache`, `.mypy_cache`, `__pycache__` | rm -rf | running the tool again |
+| python | `.ruff_cache` | `ruff clean` | running ruff again |
+| swift | `.build` | `swift package reset` | `swift build` |
+| zig | `.zig-cache`, `zig-cache`, `zig-out` | rm -rf | `zig build` |
+| elixir | `_build`, `deps` | `mix clean --deps`, `mix deps.clean --all` | `mix compile`, `mix deps.get` |
+| cmake | `build` (with a `CMakeCache.txt`), `cmake-build-debug`, `-release`, `-relwithdebinfo`, `-minsizerel` | `cmake --build … --target clean` | `cmake --build` |
+
+Each kind is a sweeper in `src/builtin/`, one file per ecosystem; to add your own, see [Adding your own](#adding-your-own).
+
+## Safety
+
+| | Meaning | `clean` |
+| --- | --- | --- |
+| safe | the project's own tooling recreates it exactly: a lockfile is there and git ignores it | asked once for all of them |
+| caution | likely recreatable, but the result may differ or it may hold something you want: `dist/`, no lockfile, not gitignored | only with `-upto caution`, asked one by one |
+| unsafe | git tracks files in it | only with `-upto unsafe`, one by one, typing each folder's name; never with uncommitted changes |
+
+Git decides the last word: a folder with tracked files is unsafe whatever it's called, and one git doesn't ignore is at
+least caution.
+
+`-upto` sets the least safe artifacts `clean` offers: `safe` (the default), `caution`, or `unsafe`, each including the
+ones before it. Unsafe ones are asked about last, and `-y` never answers them: you type the folder's name (`dist`) to
+confirm. One with uncommitted changes, untracked files included, is refused, so `git checkout -- <folder>` can always
+bring back what was deleted.
+
+## Cleaning
+
+`devsweep clean` takes the same folders and filters as the listing, shows what it will do, and asks. `-pwd` cleans
+only the folder you are in.
+
+`-y` answers every question yes, for scripts, except the typed confirmation of unsafe ones. It doesn't widen what is offered (that is still `-upto`,
+`-rm`, `-caches`, `-images`, `-volumes`) and doesn't turn off the dry run of `rm -rf`.
+
+**Just enough, or just the old.** `-until 30G` cleans only until the disk has 30 GiB free: it takes the safest
+artifacts first and, among those, the longest unbuilt, and stops once they add up. It counts only what will really
+be freed, so an rm -rf left as a dry run doesn't. `-trim 30d` keeps Rust's `target/` folders but has
+[cargo-sweep](https://github.com/holmgr/cargo-sweep) remove the build files not used for 30 days, so the next build
+stays fast; it needs `cargo install cargo-sweep`, and the size shown is the most it could free.
+
+**Tool commands first.** Each artifact is cleaned by its own tool, run in its project: `cargo clean`, `mix clean`,
+`swift package reset`, `npm run clean`. Several artifacts sharing one command (a Cargo workspace) run it once.
+
+**rm -rf only when asked, and dry by default.** Some things have no tool that removes them (`node_modules`, `.next`,
+`__pycache__`, `.venv`). They show as `rm -rf` and are left alone unless you pass `-rm`, and even then `rm -rf` only
+shows what it would delete:
+
+| You pass | Tool commands | rm -rf |
+| --- | --- | --- |
+| nothing | run, after the usual yes | only shown |
+| `--dry-run` | only shown | only shown |
+| `--dry-run=false` | run | deletes |
+
+Every `rm -rf` waits for a step of its own at the end, after all the tools' commands: the folders are listed together
+with their sizes and asked about once. At the end devsweep reports what was freed, measured again afterwards, and
+what was only shown. A command that fails doesn't count as freed.
+
+Some things it refuses outright, whatever a sweeper says:
+
+- running `clean` as root or under `sudo`;
+- `/` as a folder to scan (your home folder is fine: rm -rf never deletes it, only folders inside it);
+- an `rm -rf` of anything but a real folder (not a symlink) strictly inside a scanned folder or your home folder,
+  never one of those itself, checked again right before deleting.
+
+## Where the disk went
+
+`devsweep why` answers "where did my disk go" on one screen:
+
+```
+Disk  228.2 GiB, 80.2 GiB used, 148.0 GiB free
+
+Reclaimable  2.9 GiB  (2.8 GiB of it safe)
+  511.5 MiB   projects in ~            435.0 MiB safe; devsweep clean -rm -upto caution
+  2.4 GiB     shared caches            2.4 GiB safe; devsweep clean -caches
+```
+
+- **Disk**: the size, used and free space of the disk your home folder is on.
+- **Reclaimable**: everything devsweep can clean, safe and caution (never unsafe), by part, each with the command that
+  cleans it: projects, Docker images and volumes, local models, the shared caches and old toolchains, all counted
+  whether or not their flag was given.
+- **Docker's VM disk**: Docker Desktop, OrbStack, Colima and Rancher Desktop keep containers in one disk image.
+  Pruning frees space inside it, which isn't always given back to macOS: devsweep shows what the image takes on disk,
+  with one engine how much more that is than what Docker counts in use, and each engine's way to give it back
+  (Docker Desktop's `docker/desktop-reclaim-space`, `fstrim` inside Colima's VM or a Colima restart, `fstrim
+  /mnt/data` inside Rancher Desktop's; OrbStack shrinks its disk on its own).
+- **Local snapshots**: how many Time Machine keeps on the disk. Their size needs root to read; macOS deletes them on
+  its own when space runs low, and `sudo tmutil thinlocalsnapshots / 999999999999 4` does it now. devsweep never runs
+  as root, so it only prints that.
+
+What isn't explained (apps, your own files, macOS's "System Data") is the rest of the used space.
+
+## Docker
+
+Docker is listed after the projects when you run `devsweep` with no folders. Name folders (or pass `-pwd`) and only
+those are listed, since Docker belongs to the whole machine; `-images` and `-volumes` still ask for it. It is all read
+from one `docker system df --verbose`:
+
+- **Images**: the size only that image takes, with the layers it shares with other images shown apart
+  (`+2.9 MiB shared`), since removing it doesn't free those.
+- **Volumes**: their size.
+- For both, the containers using them and whether each is running.
+
+| | Images | Volumes |
+| --- | --- | --- |
+| a running container uses it | unsafe | unsafe |
+| only stopped containers use it | caution | caution |
+| nothing uses it | caution (a re-pull or rebuild may differ); safe if dangling (`<none>`, an old build) | caution (it holds data) |
+
+Docker only removes an image or a volume no container uses, even a stopped one. So `clean -images` and
+`clean -volumes` offer just those, one by one, through `docker image rm` and `docker volume rm`, and for the rest name
+the containers in the way (`docker rm api first`). devsweep never removes a container.
+
+**Local Kubernetes clusters**: kind and k3d run each cluster as node containers, which devsweep never removes one by
+one. They're listed per cluster instead, with the space their nodes take, and `clean -clusters` deletes a whole
+cluster with its own tool (`kind delete cluster --name dev`, `k3d cluster delete lab`), each asked, as caution.
+
+`-group image` shows Docker by image instead: each image, the containers made from it with their state and their own
+size (files they changed, and their logs), and the volumes those use. `-images` or `-volumes` on their own show only
+Docker, without scanning folders.
+
+devsweep goes through the `docker` command, so it asks whichever engine the current context points at: Docker Desktop,
+OrbStack, Colima. With Docker missing or stopped, the Docker part is simply left out; a Docker that doesn't answer
+within 5 seconds is skipped.
+
+## Local models
+
+Downloaded AI models are listed after Docker, as caution: one is often 4 to 40 GB and slow to fetch again.
+
+- **Ollama**: each model `ollama list` names, removed with `ollama rm`. Models share layers, so removing one can free
+  less than its size. With Ollama not running, its models folder (`~/.ollama/models` or `$OLLAMA_MODELS`) as a whole.
+- **LM Studio**: its models folder, `~/.lmstudio/models` or the older `~/.cache/lm-studio/models`, removed with rm -rf.
+
+`-models` lists only them, and with `clean` offers each one. Like Docker, they're left out when you name folders.
+
+## Old toolchains
+
+`-toolchains` adds the versions version managers keep installed: rustup's Rust toolchains, nvm's, fnm's and volta's
+Node versions, pyenv's Pythons, mise's installs of any tool, and SDKMAN's JDKs and friends. A version is kept, listed
+but never offered, when it is:
+
+- the manager's default (rustup's default toolchain, nvm's `default` alias, fnm's, volta's, pyenv's global, SDKMAN's
+  `current`, mise's global config);
+- the `node` or `python3` on PATH;
+- pinned by a project under the scanned folders: `rust-toolchain(.toml)`, `.nvmrc`, `.node-version`,
+  `.python-version`, `.tool-versions`, `.sdkmanrc` or `mise.toml`. A partial pin (`20`, `3.11`) keeps every version it
+  could mean.
+
+The rest are caution: a project outside the scanned folders may still need one. They're removed with the manager's
+own command (`rustup toolchain uninstall`, `fnm uninstall`, `pyenv uninstall -f`, `mise uninstall`), or with rm -rf
+for nvm, volta and SDKMAN, which have none devsweep can run.
+
+## Shared caches
+
+`-caches` adds the tool-wide caches outside any project, refilled on demand; only the ones present are listed, and on
+Linux the tools' `~/.cache` and `~/.config` folders stand in for `~/Library`. `clean -caches` offers each one, through
+the tool's own command where it has one:
+
+| Cache | Cleaned with |
+| --- | --- |
+| cargo registry, registry sources, git checkouts | rm -rf (cargo also trims these itself) |
+| go build cache, module cache | `go clean -cache`, `go clean -modcache` |
+| npm, pnpm store, yarn, bun, corepack | `npm cache clean --force`, `pnpm store prune`, `yarn cache clean`, `bun pm cache rm`, `corepack cache clean` |
+| deno, node-gyp headers | `deno clean`, rm -rf |
+| Playwright, Cypress, Puppeteer browsers | rm -rf |
+| pip, uv, poetry, pre-commit | `pip3 cache purge`, `uv cache prune`, rm -rf, `pre-commit clean` |
+| Hugging Face models and datasets (caution) | rm -rf |
+| Gradle caches and wrapper distributions | rm -rf (run `gradle --stop` first) |
+| Maven repository (caution: holds what `mvn install` put there) | rm -rf |
+| Composer, Dart pub (caution: holds global packages), Terraform plugins | `composer clear-cache`, `dart pub cache clean --force`, rm -rf |
+| ccache, sccache | `ccache --clear`, rm -rf |
+| Homebrew | `brew cleanup --prune=all` |
+| CocoaPods, Carthage, SwiftPM | `pod cache clean --all`, rm -rf |
+| Xcode derived data, documentation cache, device logs | rm -rf |
+| Device support, one entry per iOS, watchOS, tvOS or visionOS version | rm -rf (copied again when a device on it connects) |
+| Old Xcode copies in `/Applications` (all but the one `xcode-select` points to) | listed only: outside your home folder, so move them to the Trash yourself |
+| Xcode archives (caution: the dSYMs for your shipped builds' crash reports) | rm -rf |
+| Simulator caches and logs, unavailable iOS simulators | rm -rf, `xcrun simctl delete unavailable` |
+| Simulator runtimes (caution; the newest per platform, which Xcode uses, is never offered) | `xcrun simctl runtime delete` |
+| Android SDK cache | rm -rf |
+| minikube (caution: every cluster) | `minikube delete --all --purge` |
+| JetBrains IDEs, VS Code and Cursor cached data, VS Code extension downloads | rm -rf (quit the editor first) |
+| Electron, electron-builder downloads | rm -rf |
+| Docker's reclaimable space | `docker system prune -f` (caution) |
+
+## Git
+
+`-git` lists `.git` folders over 500 MiB (`git gc --aggressive --prune=now` may shrink one) and worktrees whose
+repository is gone, found under the scanned folders. They're never cleaned: what's in them is history.
+
+## Listing
+
+- **`-group project|kind|safety|image`**: a heading per group with its count and total, the rows under it, and the
+  column the heading already says left out. Groups follow `-sort`; safety groups always go safe, caution, unsafe.
+  `-tree` with `-group kind` or `safety` draws a tree per group (the tree already groups by project).
+- **`-sort size|age|path`**: biggest, longest unbuilt or A to Z first. Add `:asc` or `:desc` for the other way round
+  (`size:asc` is smallest first, `path:desc` Z to A). Rows inside groups and the groups themselves both follow it.
+- **`-min`** (default 1M), **`-older`**, **`-kind`** filter; a line under the summary says how many artifacts they
+  hid and why, so an empty result isn't a mystery.
+- **`-json`**: artifacts, roots, Docker's images, containers and volumes (when Docker is listed), and with
+  `-caches` the caches.
+
+Output is colored on a terminal and plain otherwise, or with `NO_COLOR` set.
+
+## Flags
+
+| Flag | |
+| --- | --- |
+| `-caches` | also list shared tool caches; with clean, offer each one |
+| `-clusters` | only local Kubernetes clusters (kind, k3d); with clean, offer each one for deletion |
+| `-detailed` | with `-tree`, also each artifact's kind, last build, rebuild command and why it isn't safe |
+| `--dry-run` | clean: show what would run, run nothing; rm -rf is always a dry run unless `--dry-run=false` |
+| `-git` | also list `.git` folders over 500 MiB and orphaned worktrees; never cleaned |
+| `-group` | group by `project`, `kind` or `safety`; `image` arranges Docker by image |
+| `-images` | only Docker images; with clean, offer each one |
+| `-json` | print JSON |
+| `-kind` | only these kinds, comma separated: `rust,node,go,python,swift,zig,elixir,cmake`, or any sweeper you add |
+| `-models` | only local AI models (Ollama, LM Studio); with clean, offer each one |
+| `-min` | hide artifacts smaller than this, e.g. `100M`, `1G` (default `1M`) |
+| `-older` | only artifacts not built for this long, e.g. `14d`, `3w`, `2mo`, `12h` |
+| `-pwd` | the current folder instead of your home folder, as if named; with folders, it is added to them |
+| `-rm` | clean: also offer what only rm -rf removes (`node_modules`, `.next`, ...) |
+| `-sort` | `size` (default), `age` or `path`, optionally with `:asc` or `:desc` |
+| `-toolchains` | also list old toolchains (rustup, nvm, fnm, volta, pyenv, mise, SDKMAN); with clean, offer each one |
+| `-tree` | a tree instead of a table: each artifact's size, safety and clean command |
+| `-trim` | clean: Rust projects lose only build files unused for this long, through cargo-sweep, e.g. `30d` |
+| `-until` | clean: stop once the disk has this much free, safest and longest-unbuilt artifacts first, e.g. `30G` |
+| `-upto` | clean: the least safe artifacts to offer: `safe` (default), `caution` (each asked) or `unsafe` (each typed out, never by `-y`) |
+| `-volumes` | only Docker volumes; with clean, offer each one |
+| `-y` | clean: answer yes to every question but an unsafe one's; what is offered still follows the other flags |
+
+## Adding your own
+
+devsweep is a library with a thin binary on top. Everything it knows goes through one trait, `Sweeper`: the built-in
+Rust, Node and Docker support are sweepers like any other. To teach it something new, write a small binary of your own:
+
+```rust
+use devsweep::sweep::{Registry, SimpleSweeper};
+
+fn main() {
+    let mut registry = Registry::builtin();
+    registry.add(
+        SimpleSweeper::new("gradle")
+            .folders(&["build", ".gradle"])
+            .markers(&["build.gradle", "build.gradle.kts"])
+            .clean(&["./gradlew", "clean"])
+            .rebuild("./gradlew build"),
+    );
+    devsweep::cli::run(&registry);
+}
+```
+
+`SimpleSweeper` covers "folders with these names, beside one of these files, cleaned and rebuilt by these commands".
+For anything smarter, implement `Sweeper` yourself:
+
+- `dirs` and `claim` for folders met while walking: say whether a folder is yours, how safe removing it is, how it's
+  cleaned (`Clean::Tool`, `Clean::RemoveDir` or `Clean::Blocked`) and rebuilt.
+- `list` and `sections` for things found on their own, outside any project (a cache, Docker's images), given the
+  folders being scanned: return `Item`s, and describe the table they're listed in.
+
+The engine does the rest: walking, measuring, rendering, asking before cleaning, and the safety net, which a sweeper
+can't switch off. Git-tracked files make a folder unsafe whatever the sweeper says, a folder git doesn't ignore is at
+least caution, and `rm -rf` stays a dry run unless `--dry-run=false`. The first registered sweeper to claim a folder
+keeps it, so the built-ins can't be overridden by accident. `tests/custom_sweeper.rs` shows each of these through the
+public API.
+
+## How it works
+
+- **Sizes** are disk usage (allocated blocks), not file lengths. A hard-linked file counts once, and counts as
+  "shared" when some of its links live outside the artifact, since deleting the artifact doesn't free it.
+- **Speed**: every artifact's folders go onto one queue that all cores work through, so a single huge `node_modules`
+  is spread across them. The git checks, the cache sizes and the Docker query run at the same time as the scan.
+  A whole home folder, the default, takes about 0.4 s.
+- **Git**: `git ls-files` and `git check-ignore` in the project decide whether an artifact is tracked or ignored.
+
+## Development
+
+```sh
+make test    # clippy with every lint as an error, then the tests
+```
+
+The lints are strict and live in `Cargo.toml` and `clippy.toml`: clippy's `pedantic`, `nursery` and `cargo` groups and a
+set of `restriction` lints are all errors, as are dead code and anything unused. `#[allow]` isn't permitted; an
+exception is an `#[expect(…, reason = "…")]` that says why.
+
+[CONTRIBUTING.md](../CONTRIBUTING.md) covers the rest: how to propose a change, add a sweeper, and what CI checks.
+Changes are recorded in [CHANGELOG.md](../CHANGELOG.md).

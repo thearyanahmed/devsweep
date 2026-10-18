@@ -11,7 +11,7 @@ use crate::sweep::{Clean, Item, Safety, Section, Sweeper, exists};
 /// A shared, tool-wide cache outside any project.
 #[derive(Debug, Serialize)]
 pub(super) struct Cache {
-    pub name: &'static str,
+    pub name: String,
     pub path: PathBuf,
     pub bytes: u64,
     /// The tool's own command for trimming it; `None` means only rm -rf `path`.
@@ -25,9 +25,9 @@ pub(super) struct Cache {
     docker: bool,
 }
 
-fn cache(name: &'static str, path: PathBuf, cmd: &[&str]) -> Cache {
+fn cache(name: &str, path: PathBuf, cmd: &[&str]) -> Cache {
     Cache {
-        name,
+        name: name.to_owned(),
         path,
         bytes: 0,
         cmd: (!cmd.is_empty()).then(|| cmd.iter().map(ToString::to_string).collect()),
@@ -224,7 +224,7 @@ fn jvm_and_native(h: &Home) -> Vec<Cache> {
 
 /// Xcode, the simulators, and the Swift and Objective-C package managers.
 fn apple(h: &Home) -> Vec<Cache> {
-    vec![
+    let mut list = vec![
         cache(
             "cocoapods",
             h.at("Library/Caches/CocoaPods"),
@@ -245,18 +245,6 @@ fn apple(h: &Home) -> Vec<Cache> {
             h.at("Library/Developer/Xcode/DerivedData"),
             &[],
         ),
-        cache(
-            "xcode ios device support",
-            h.at("Library/Developer/Xcode/iOS DeviceSupport"),
-            &[],
-        )
-        .note("copied again, slowly, the next time a device connects"),
-        cache(
-            "xcode watchos device support",
-            h.at("Library/Developer/Xcode/watchOS DeviceSupport"),
-            &[],
-        )
-        .note("copied again, slowly, the next time a device connects"),
         cache(
             "xcode documentation cache",
             h.at("Library/Developer/Xcode/DocumentationCache"),
@@ -286,7 +274,36 @@ fn apple(h: &Home) -> Vec<Cache> {
             &["xcrun", "simctl", "delete", "unavailable"],
         )
         .note("only removes simulators for runtimes no longer installed"),
-    ]
+    ];
+    list.extend(device_support(h));
+    list
+}
+
+/// What Xcode copied from each device OS version it met, one entry per version: an old one goes once no device runs
+/// it, and a new one is copied again, slowly, the next time a device connects.
+fn device_support(h: &Home) -> Vec<Cache> {
+    ["iOS", "watchOS", "tvOS", "visionOS"]
+        .into_iter()
+        .flat_map(|os| {
+            let dir = h.at(&format!("Library/Developer/Xcode/{os} DeviceSupport"));
+            let mut versions: Vec<(String, PathBuf)> = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+                .collect();
+            versions.sort();
+            versions.into_iter().map(move |(v, path)| {
+                cache(
+                    &format!("{} device support {v}", os.to_lowercase()),
+                    path,
+                    &[],
+                )
+                .note("copied again, slowly, the next time a device on it connects")
+            })
+        })
+        .collect()
 }
 
 /// Android's and the editors' own caches.
@@ -372,7 +389,11 @@ impl Sweeper for Caches {
     }
 
     fn list(&self, _roots: &[PathBuf]) -> Vec<Item> {
-        let runtimes = thread::spawn(simulators::runtimes);
+        let runtimes = thread::spawn(|| {
+            let mut apple = simulators::runtimes();
+            apple.extend(simulators::xcodes());
+            apple
+        });
         let mut items: Vec<Item> = caches()
             .into_iter()
             .map(|c| Item {
@@ -380,7 +401,11 @@ impl Sweeper for Caches {
                 bytes: Some(c.bytes),
                 safety: c.safety,
                 note: c.note.to_owned(),
-                ..Item::new("cache", c.name, c.cmd.map_or(Clean::RemoveDir, Clean::Tool))
+                ..Item::new(
+                    "cache",
+                    &c.name,
+                    c.cmd.map_or(Clean::RemoveDir, Clean::Tool),
+                )
             })
             .collect();
         items.extend(runtimes.join().unwrap_or_default());

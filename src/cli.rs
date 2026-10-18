@@ -49,12 +49,20 @@ const FLAGS: &[Flag] = &[
         "also list shared tool caches (cargo, go, npm, pnpm, brew, ...)",
     ),
     flag(
+        "clusters",
+        "only local Kubernetes clusters (kind, k3d); with clean, offer each one for deletion",
+    ),
+    flag(
         "detailed",
         "-tree: also show each artifact's kind, last build, rebuild command and why it isn't safe",
     ),
     flag(
         "dry-run",
         "clean: show what would run, run nothing; rm -rf is always a dry run unless --dry-run=false",
+    ),
+    flag(
+        "git",
+        "also list .git folders over 500 MiB and worktrees whose repository is gone; never cleaned",
     ),
     string(
         "group",

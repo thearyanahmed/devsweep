@@ -1,0 +1,127 @@
+name: Release
+
+# Pushing a tag like v0.2.0 builds devsweep for macOS and Linux, publishes a GitHub release with the changelog's
+# notes for that version, and, when the HOMEBREW_TAP_TOKEN secret is set, updates the formula in
+# thearyanahmed/homebrew-tap.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-14 }
+          - { target: x86_64-apple-darwin, os: macos-14 }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name="devsweep-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/devsweep" README.md LICENSE-MIT LICENSE-APACHE "$name/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: devsweep-*.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Notes from the changelog
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" 'index($0, "## [" v "]") == 1 {on = 1; next} /^## \[/ {on = 0} on' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no section for $version"; exit 1; }
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v8
+        if: env.TAP_TOKEN != ''
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Update the tap
+        if: env.TAP_TOKEN != ''
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          base="https://github.com/thearyanahmed/devsweep/releases/download/${GITHUB_REF_NAME}"
+          sha() { cut -d' ' -f1 "dist/devsweep-${GITHUB_REF_NAME}-$1.tar.gz.sha256"; }
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/thearyanahmed/homebrew-tap" tap
+          mkdir -p tap/Formula
+          cat > tap/Formula/devsweep.rb <<EOF
+          class Devsweep < Formula
+            desc "Find and clean what's eating a developer's disk"
+            homepage "https://github.com/thearyanahmed/devsweep"
+            version "${version}"
+            license any_of: ["MIT", "Apache-2.0"]
+
+            on_macos do
+              on_arm do
+                url "${base}/devsweep-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz"
+                sha256 "$(sha aarch64-apple-darwin)"
+              end
+              on_intel do
+                url "${base}/devsweep-${GITHUB_REF_NAME}-x86_64-apple-darwin.tar.gz"
+                sha256 "$(sha x86_64-apple-darwin)"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${base}/devsweep-${GITHUB_REF_NAME}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "$(sha aarch64-unknown-linux-gnu)"
+              end
+              on_intel do
+                url "${base}/devsweep-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "$(sha x86_64-unknown-linux-gnu)"
+              end
+            end
+
+            def install
+              bin.install "devsweep"
+            end
+
+            test do
+              system bin/"devsweep", "-h"
+            end
+          end
+          EOF
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/devsweep.rb
+          git commit -m "devsweep ${version}"
+          git push

@@ -94,7 +94,7 @@ pub(crate) struct VmDisk {
 /// inside them, which isn't always given back to macOS.
 pub(super) fn vm_disks() -> Vec<VmDisk> {
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let mut found = vec![
+    let found = vec![
         (
             "Docker Desktop",
             home.join("Library/Containers/com.docker.docker/Data/vms/0/data"),
@@ -108,11 +108,7 @@ pub(super) fn vm_disks() -> Vec<VmDisk> {
             home.join("Library/Application Support/rancher-desktop/lima/0"),
         ),
     ];
-    // Colima keeps one VM per profile.
-    if let Ok(profiles) = std::fs::read_dir(home.join(".colima/_lima")) {
-        found.extend(profiles.flatten().map(|p| ("Colima", p.path())));
-    }
-    found
+    let mut disks: Vec<VmDisk> = found
         .into_iter()
         .filter(|(_, path)| path.is_dir())
         .map(|(engine, path)| VmDisk {
@@ -120,7 +116,29 @@ pub(super) fn vm_disks() -> Vec<VmDisk> {
             allocated: files_size(&path),
             path,
         })
-        .collect()
+        .collect();
+    // Colima keeps one Lima VM per profile, beside Lima's own _config and _disks; since v0.9 the container data is on
+    // a disk of its own in _disks, named after the profile.
+    let lima = home.join(".colima/_lima");
+    if let Ok(profiles) = std::fs::read_dir(&lima) {
+        for p in profiles
+            .flatten()
+            .filter(|p| !p.file_name().to_string_lossy().starts_with('_'))
+        {
+            let data = lima.join("_disks").join(p.file_name());
+            let extra = if data.is_dir() {
+                files_size(&data).unwrap_or(0)
+            } else {
+                0
+            };
+            disks.push(VmDisk {
+                engine: "Colima",
+                allocated: files_size(&p.path()).map(|vm| vm + extra),
+                path: p.path(),
+            });
+        }
+    }
+    disks
 }
 
 /// What the files directly in `dir` take on disk.
@@ -339,6 +357,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn finds_kind_and_k3d_nodes() {
+        let node = |name: &str, image: &str| Container {
+            name: name.into(),
+            running: true,
+            image: image.into(),
+            bytes: 0,
+            volumes: Vec::new(),
+        };
+        assert_eq!(
+            cluster_of(&node("dev-control-plane", "kindest/node:v1.30.0")),
+            Some("kind dev".into())
+        );
+        assert_eq!(
+            cluster_of(&node("dev-worker2", "kindest/node:v1.30.0")),
+            Some("kind dev".into())
+        );
+        assert_eq!(
+            cluster_of(&node(
+                "dev-external-load-balancer",
+                "kindest/haproxy:v20230606"
+            )),
+            Some("kind dev".into())
+        );
+        assert_eq!(
+            cluster_of(&node("k3d-lab-server-0", "rancher/k3s:v1.30")),
+            Some("k3d lab".into())
+        );
+        assert_eq!(
+            cluster_of(&node("k3d-lab-serverlb", "ghcr.io/k3d-io/k3d-proxy")),
+            Some("k3d lab".into())
+        );
+        assert_eq!(cluster_of(&node("api", "postgres:16")), None);
+        assert_eq!(
+            clusters(&[
+                node("dev-control-plane", "kindest/node"),
+                node("dev-worker", "kindest/node")
+            ])[0]
+                .clean,
+            Clean::Tool(
+                ["kind", "delete", "cluster", "--name", "dev"]
+                    .map(str::to_owned)
+                    .to_vec()
+            )
+        );
+    }
+
+    #[test]
     fn sizes() {
         assert_eq!(size("1.2GB (40%)"), Some(1_200_000_000));
         assert_eq!(size("0B"), Some(0));
@@ -420,6 +485,7 @@ pub(super) struct Docker;
 const IMAGE: &str = "docker image";
 const CONTAINER: &str = "docker container";
 const VOLUME: &str = "docker volume";
+const CLUSTER: &str = "local cluster";
 
 impl Sweeper for Docker {
     fn name(&self) -> &'static str {
@@ -464,6 +530,18 @@ impl Sweeper for Docker {
                 unused_title: "Docker volumes no container uses",
                 grouped_title: "",
             },
+            Section {
+                kind: CLUSTER,
+                title: "Local Kubernetes clusters",
+                noun: "CLUSTER",
+                note: "(kind and k3d; devsweep clean -clusters deletes each one with its own tool)",
+                paths: false,
+                users: false,
+                listed: true,
+                flag: Some("clusters"),
+                unused_title: "",
+                grouped_title: "",
+            },
         ]
     }
 
@@ -474,6 +552,7 @@ impl Sweeper for Docker {
 
 /// A snapshot's images, containers and volumes, as items.
 fn items(s: Snapshot) -> Vec<Item> {
+    let clusters = clusters(&s.containers);
     let images = s.images.into_iter().map(|i| {
         let id = display_name(&i.id, &i.name);
         removable(Item {
@@ -506,7 +585,63 @@ fn items(s: Snapshot) -> Vec<Item> {
             ..Item::new(VOLUME, &v.name, Clean::Tool(Vec::new()))
         })
     });
-    images.chain(containers).chain(volumes).collect()
+    images
+        .chain(containers)
+        .chain(volumes)
+        .chain(clusters)
+        .collect()
+}
+
+/// The kind and k3d clusters among the containers, each removed with its own tool: devsweep never removes a container
+/// itself, and deleting a node container alone would leave the cluster broken.
+fn clusters(containers: &[Container]) -> Vec<Item> {
+    let mut by: Vec<(String, Vec<&Container>)> = Vec::new();
+    for c in containers {
+        let Some(id) = cluster_of(c) else { continue };
+        match by.iter_mut().find(|(i, _)| *i == id) {
+            Some((_, nodes)) => nodes.push(c),
+            None => by.push((id, vec![c])),
+        }
+    }
+    by.into_iter()
+        .map(|(id, nodes)| {
+            let (tool, name) = id.split_once(' ').unwrap_or((&id, ""));
+            let argv = if tool == "kind" {
+                vec!["kind", "delete", "cluster", "--name", name]
+            } else {
+                vec!["k3d", "cluster", "delete", name]
+            };
+            Item {
+                bytes: Some(nodes.iter().map(|n| n.bytes).sum()),
+                safety: Safety::Caution,
+                why: "deletes the whole cluster and what runs in it".into(),
+                note: format!("{} node containers", nodes.len()),
+                running: Some(nodes.iter().any(|n| n.running)),
+                ..Item::new(
+                    CLUSTER,
+                    &id,
+                    Clean::Tool(argv.into_iter().map(str::to_owned).collect()),
+                )
+            }
+        })
+        .collect()
+}
+
+/// Which cluster a container is a node of, as `kind <name>` or `k3d <name>`: kind's nodes run its `kindest/` images (`node`, and `haproxy` for the load
+/// balancer)
+/// image and are named `<name>-control-plane`, `<name>-worker2`, ...; k3d's are named `k3d-<name>-server-0`, ...
+fn cluster_of(c: &Container) -> Option<String> {
+    if c.image.starts_with("kindest/") {
+        let name = ["-control-plane", "-worker", "-external-load-balancer"]
+            .iter()
+            .find_map(|role| c.name.split_once(role).map(|(name, _)| name))?;
+        return Some(format!("kind {name}"));
+    }
+    let rest = c.name.strip_prefix("k3d-")?;
+    let name = ["-server-", "-agent-", "-serverlb"]
+        .iter()
+        .find_map(|role| rest.split_once(role).map(|(name, _)| name))?;
+    Some(format!("k3d {name}"))
 }
 
 /// Sets how an image or volume is removed: Docker's command once no container uses it, which Docker insists on even

@@ -100,7 +100,7 @@ fn parts(arts: &[Artifact], items: &[Item]) -> Vec<(&'static str, Part, &'static
         .filter(|i| i.safety != Safety::Unsafe && !matches!(i.clean, Clean::Blocked(_)))
     {
         let part = match i.kind.as_str() {
-            "docker image" | "docker volume" => &mut docker,
+            "docker image" | "docker volume" | "local cluster" => &mut docker,
             "model" => &mut models,
             "toolchain" => &mut toolchains,
             // docker system prune's share is Docker's images and volumes again, counted above.
@@ -145,6 +145,7 @@ fn vm_report(vms: &[VmDisk], docker_used: Option<u64>) {
                 dim(&format!("can't read it: {e}"))
             ),
         }
+        println!("  {:<10}  {}", "", dim(reclaim_step(v.engine)));
     }
     // With one engine, Docker's own count is what's inside its disk; the difference is held back.
     if let ([v], Some(used)) = (vms, docker_used)
@@ -160,6 +161,19 @@ fn vm_report(vms: &[VmDisk], docker_used: Option<u64>) {
                 v.engine
             ))
         );
+    }
+}
+
+/// How each engine gives the space Docker freed back to macOS. devsweep only says it: these reach into the VM.
+fn reclaim_step(engine: &str) -> &'static str {
+    match engine {
+        "Docker Desktop" => {
+            "to give space back: docker run --privileged --pid=host docker/desktop-reclaim-space"
+        }
+        "OrbStack" => "OrbStack gives freed space back to macOS on its own",
+        "Colima" => "to give space back: colima ssh -- sudo fstrim -a, or restart Colima",
+        "Rancher Desktop" => "to give space back: rdctl shell sudo fstrim /mnt/data",
+        _ => "",
     }
 }
 
@@ -180,6 +194,11 @@ fn snapshots_report() {
             dim(
                 "(Time Machine's; their size needs root to read, and macOS deletes them when space runs low)"
             )
+        );
+        // devsweep never runs as root, so it only says how.
+        println!(
+            "  {}",
+            dim("to thin them now: sudo tmutil thinlocalsnapshots / 999999999999 4")
         );
     }
 }
