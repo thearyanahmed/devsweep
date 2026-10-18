@@ -5,6 +5,14 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- More shared caches with `-caches`: Gradle, Maven, Hugging Face, poetry, pre-commit, deno, node-gyp, Playwright,
+  Cypress and Puppeteer browsers, Composer, Dart pub, Terraform plugins, ccache, sccache, CocoaPods, Carthage,
+  SwiftPM, Xcode archives, device support, documentation cache and device logs, simulator caches and logs, the
+  Android SDK cache, and JetBrains, VS Code and Cursor cached data. Ones that are slow or impossible to refill exactly
+  are caution.
+
 ## [0.1.0]
 
 The first release.

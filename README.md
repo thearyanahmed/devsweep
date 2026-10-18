@@ -140,7 +140,8 @@ within 5 seconds is skipped.
 
 ## Shared caches
 
-`-caches` adds the tool-wide caches outside any project, refilled on demand. `clean -caches` offers each one, through
+`-caches` adds the tool-wide caches outside any project, refilled on demand; only the ones present are listed, and on
+Linux the tools' `~/.cache` and `~/.config` folders stand in for `~/Library`. `clean -caches` offers each one, through
 the tool's own command where it has one:
 
 | Cache | Cleaned with |
@@ -148,9 +149,21 @@ the tool's own command where it has one:
 | cargo registry, registry sources, git checkouts | rm -rf (cargo also trims these itself) |
 | go build cache, module cache | `go clean -cache`, `go clean -modcache` |
 | npm, pnpm store, yarn, bun, corepack | `npm cache clean --force`, `pnpm store prune`, `yarn cache clean`, `bun pm cache rm`, `corepack cache clean` |
-| pip, uv | `pip3 cache purge`, `uv cache prune` |
+| deno, node-gyp headers | `deno clean`, rm -rf |
+| Playwright, Cypress, Puppeteer browsers | rm -rf |
+| pip, uv, poetry, pre-commit | `pip3 cache purge`, `uv cache prune`, rm -rf, `pre-commit clean` |
+| Hugging Face models and datasets (caution) | rm -rf |
+| Gradle caches and wrapper distributions | rm -rf (run `gradle --stop` first) |
+| Maven repository (caution: holds what `mvn install` put there) | rm -rf |
+| Composer, Dart pub (caution: holds global packages), Terraform plugins | `composer clear-cache`, `dart pub cache clean --force`, rm -rf |
+| ccache, sccache | `ccache --clear`, rm -rf |
 | Homebrew | `brew cleanup --prune=all` |
-| Xcode derived data, unavailable iOS simulators | rm -rf, `xcrun simctl delete unavailable` |
+| CocoaPods, Carthage, SwiftPM | `pod cache clean --all`, rm -rf |
+| Xcode derived data, documentation cache, device logs, iOS and watchOS device support | rm -rf |
+| Xcode archives (caution: the dSYMs for your shipped builds' crash reports) | rm -rf |
+| Simulator caches and logs, unavailable iOS simulators | rm -rf, `xcrun simctl delete unavailable` |
+| Android SDK cache | rm -rf |
+| JetBrains IDEs, VS Code and Cursor cached data, VS Code extension downloads | rm -rf (quit the editor first) |
 | Electron, electron-builder downloads | rm -rf |
 | Docker's reclaimable space | `docker system prune -f` (caution) |
 
