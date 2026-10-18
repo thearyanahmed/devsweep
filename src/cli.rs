@@ -6,12 +6,13 @@ use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::time::{Duration, SystemTime};
 
+use crate::cmd::on_path;
 use crate::output::{
     Family, Group, Order, ago, bold, dim, group_heading, groups, human, plural, print_by_parent,
     print_list, print_section, print_tree, reset, safety_label, summary, tilde,
 };
 use crate::scan::Artifact;
-use crate::sweep::{Item, Registry, Safety, Section, Sweeper};
+use crate::sweep::{Clean, Item, Registry, Safety, Section, Sweeper};
 use crate::{clean, scan};
 
 /// A command-line flag, Go style: `-name`, `--name`, `-name=value` or `-name value`.
@@ -103,6 +104,16 @@ const FLAGS: &[Flag] = &[
     ),
     flag("tree", "show a tree instead of a table"),
     string(
+        "trim",
+        "",
+        "clean: Rust projects lose only build files unused for this long (cargo-sweep), not all of target/, e.g. 30d",
+    ),
+    string(
+        "until",
+        "",
+        "clean: stop once the disk has this much free, safest and longest-unbuilt artifacts first, e.g. 30G",
+    ),
+    string(
         "upto",
         "safe",
         "clean: the least safe artifacts to offer: safe, caution (each asked) or unsafe (each typed out; never -y)",
@@ -129,6 +140,10 @@ pub(crate) struct Options {
     pub(crate) json: bool,
     /// --dry-run as given: `None` leaves tool commands running and rm -rf as a dry run.
     pub(crate) dry_run: Option<bool>,
+    /// -until: the free space clean stops at.
+    pub(crate) until: Option<u64>,
+    /// -trim: how long a Rust build file goes unused before cargo-sweep removes it, instead of cargo clean.
+    pub(crate) trim: Option<Duration>,
     /// -upto: the least safe artifacts clean offers.
     pub(crate) upto: Safety,
     pub(crate) rm: bool,
@@ -340,6 +355,12 @@ fn options(set: &BTreeMap<&'static str, String>) -> Options {
         detailed: on("detailed"),
         json: on("json"),
         dry_run: set.get("dry-run").map(|v| v == "true" || v == "1"),
+        until: Some(get("until"))
+            .filter(|u| !u.is_empty())
+            .map(|u| parse_size(&u).unwrap_or_else(|e| fail(format!("-until: {e}")))),
+        trim: Some(get("trim"))
+            .filter(|t| !t.is_empty())
+            .map(|t| parse_age(&t).unwrap_or_else(|e| fail(format!("-trim: {e}")))),
         upto: match get("upto").as_str() {
             "safe" => Safety::Safe,
             "caution" => Safety::Caution,
@@ -349,8 +370,9 @@ fn options(set: &BTreeMap<&'static str, String>) -> Options {
         rm: on("rm"),
         yes: on("y"),
         by_image: get("group") == "image",
-        older: (!older.is_empty()).then(|| parse_age(&older).unwrap_or_else(|e| fail(e))),
-        min: parse_size(&get("min")).unwrap_or_else(|e| fail(e)),
+        older: (!older.is_empty())
+            .then(|| parse_age(&older).unwrap_or_else(|e| fail(format!("-older: {e}")))),
+        min: parse_size(&get("min")).unwrap_or_else(|e| fail(format!("-min: {e}"))),
         kinds: (!kinds.is_empty()).then(|| kinds.split(',').map(|k| k.trim().to_owned()).collect()),
         order: Order::parse(&get("sort")).unwrap_or_else(|e| fail(e)),
         group: match get("group").as_str() {
@@ -480,6 +502,13 @@ pub fn run(registry: &Registry) {
             .map(|sec| (sec.clone(), of_kind(&items, sec.kind)))
             .filter(|(_, items)| !items.is_empty())
             .collect();
+        if o.trim.is_some() && !on_path("cargo-sweep") {
+            fail("-trim needs cargo-sweep: cargo install cargo-sweep");
+        }
+        let shown = match o.until {
+            Some(target) => until(target, shown, &o),
+            None => shown,
+        };
         process::exit(clean::run_clean(&roots, &shown, &offered, &o));
     }
     if o.json {
@@ -490,6 +519,62 @@ pub fn run(registry: &Registry) {
         print_listing(&roots, &all, &shown, &o);
     }
     print_sections(&sections, &items, &o, only);
+}
+
+/// The artifacts clean -until takes: safest first, then the longest unbuilt, until what they free brings the disk to
+/// `target` free. Only ones that will really be freed count: an rm -rf that stays a dry run doesn't.
+fn until<'a>(target: u64, arts: Vec<&'a Artifact>, o: &Options) -> Vec<&'a Artifact> {
+    let free = crate::why::free_space()
+        .unwrap_or_else(|| fail("-until: couldn't read the disk's free space"));
+    if free >= target {
+        println!(
+            "{} free already: -until {} needs nothing cleaned",
+            human(free),
+            human(target)
+        );
+        return Vec::new();
+    }
+    let need = target - free;
+    let mut picks: Vec<&Artifact> = arts
+        .into_iter()
+        .filter(|a| {
+            a.safety <= o.upto
+                && match a.clean {
+                    Clean::Tool(_) => true,
+                    Clean::RemoveDir => o.rm && o.dry_run.is_some(),
+                    Clean::Blocked(_) => false,
+                }
+        })
+        .collect();
+    picks.sort_by_key(|a| (a.safety, a.last_built));
+    let mut sum = 0;
+    let chosen: Vec<&Artifact> = picks
+        .into_iter()
+        .take_while(|a| {
+            let more = sum < need;
+            if more {
+                sum += a.freed();
+            }
+            more
+        })
+        .collect();
+    let short = if sum < need {
+        format!("; that's all there is, {} short", human(need - sum))
+    } else {
+        String::new()
+    };
+    println!(
+        "{}\n",
+        dim(&format!(
+            "-until {}: {} free now, so {} ({}) of the {} needed, safest and longest unbuilt first{short}",
+            human(target),
+            human(free),
+            plural(chosen.len(), "artifact"),
+            human(sum),
+            human(need)
+        ))
+    );
+    chosen
 }
 
 fn of_kind<'a>(items: &'a [Item], kind: &str) -> Vec<&'a Item> {
@@ -754,7 +839,7 @@ fn parse_age(s: &str) -> Result<Duration, String> {
             break;
         }
     }
-    Err(format!("bad -older {s:?}: use e.g. 12h, 14d, 3w, 2mo, 1y"))
+    Err(format!("bad age {s:?}: use e.g. 12h, 14d, 3w, 2mo, 1y"))
 }
 
 #[expect(
@@ -763,8 +848,8 @@ fn parse_age(s: &str) -> Result<Duration, String> {
     clippy::cast_precision_loss,
     reason = "the value is checked non-negative, and a fraction of a byte doesn't matter"
 )]
-fn parse_size(s: &str) -> Result<u64, String> {
-    let upper = s.to_uppercase();
+fn parse_size(input: &str) -> Result<u64, String> {
+    let upper = input.to_uppercase();
     let s = upper.strip_suffix('B').unwrap_or(&upper);
     let s = s.strip_suffix('I').unwrap_or(s);
     let (num, mult) = ["K", "M", "G", "T"]
@@ -774,7 +859,7 @@ fn parse_size(s: &str) -> Result<u64, String> {
         .unwrap_or((s, 1));
     match num.parse::<f64>() {
         Ok(v) if v >= 0.0 => Ok((v * mult as f64) as u64),
-        _ => Err("bad -min: use e.g. 500K, 100M, 1G".into()),
+        _ => Err(format!("bad size {input:?}: use e.g. 500K, 100M, 1G")),
     }
 }
 

@@ -40,8 +40,7 @@ pub(crate) fn report(roots: &[PathBuf], arts: &[Artifact], items: &[Item]) {
             vms.join().expect("the VM disk thread panicked"),
         )
     });
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    if let Some(d) = output("df", &["-Pk", &home.to_string_lossy()]).and_then(|o| parse_df(&o)) {
+    if let Some(d) = disk() {
         let used = d.size.saturating_sub(d.free);
         println!(
             "{}  {}, {} used, {}",
@@ -183,6 +182,17 @@ fn snapshots_report() {
             )
         );
     }
+}
+
+/// The disk the home folder is on, as `df` sees it.
+fn disk() -> Option<Disk> {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    output("df", &["-Pk", &home.to_string_lossy()]).and_then(|o| parse_df(&o))
+}
+
+/// The free space on the disk the home folder is on, for `clean -until`.
+pub(crate) fn free_space() -> Option<u64> {
+    disk().map(|d| d.free)
 }
 
 /// The size and free space in `df -Pk`'s table, from KiB.

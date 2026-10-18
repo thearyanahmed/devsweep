@@ -58,6 +58,8 @@ devsweep clean -pwd               # only the project or folder you are in
 devsweep clean -pwd -y            # the same, answering yes to every question
 devsweep clean -caches -images    # also offers caches and Docker images, one by one
 devsweep clean -upto caution      # also caution artifacts (dist/, no lockfile), one by one
+devsweep clean -until 30G         # only enough to leave 30 GiB free, safest and longest unbuilt first
+devsweep clean -trim 30d          # Rust: drop only build files unused for 30 days (cargo-sweep)
 ```
 
 With no folders named, devsweep scans your home folder, wherever your projects are: `~/dev`, `~/Desktop`, a repo
@@ -115,6 +117,12 @@ only the folder you are in.
 
 `-y` answers every question yes, for scripts, except the typed confirmation of unsafe ones. It doesn't widen what is offered (that is still `-upto`,
 `-rm`, `-caches`, `-images`, `-volumes`) and doesn't turn off the dry run of `rm -rf`.
+
+**Just enough, or just the old.** `-until 30G` cleans only until the disk has 30 GiB free: it takes the safest
+artifacts first and, among those, the longest unbuilt, and stops once they add up. It counts only what will really
+be freed, so an rm -rf left as a dry run doesn't. `-trim 30d` keeps Rust's `target/` folders but has
+[cargo-sweep](https://github.com/holmgr/cargo-sweep) remove the build files not used for 30 days, so the next build
+stays fast; it needs `cargo install cargo-sweep`, and the size shown is the most it could free.
 
 **Tool commands first.** Each artifact is cleaned by its own tool, run in its project: `cargo clean`, `mix clean`,
 `swift package reset`, `npm run clean`. Several artifacts sharing one command (a Cargo workspace) run it once.
@@ -285,6 +293,8 @@ Output is colored on a terminal and plain otherwise, or with `NO_COLOR` set.
 | `-sort` | `size` (default), `age` or `path`, optionally with `:asc` or `:desc` |
 | `-toolchains` | also list old toolchains (rustup, nvm, fnm, volta, pyenv, mise, SDKMAN); with clean, offer each one |
 | `-tree` | a tree instead of a table: each artifact's size, safety and clean command |
+| `-trim` | clean: Rust projects lose only build files unused for this long, through cargo-sweep, e.g. `30d` |
+| `-until` | clean: stop once the disk has this much free, safest and longest-unbuilt artifacts first, e.g. `30G` |
 | `-upto` | clean: the least safe artifacts to offer: `safe` (default), `caution` (each asked) or `unsafe` (each typed out, never by `-y`) |
 | `-volumes` | only Docker volumes; with clean, offer each one |
 | `-y` | clean: answer yes to every question but an unsafe one's; what is offered still follows the other flags |

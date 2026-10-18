@@ -22,6 +22,10 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `clean -until 30G`: clean only until the disk has that much free, safest and longest-unbuilt artifacts first.
+- `clean -trim 30d`: Rust projects lose only the build files unused that long, through cargo-sweep, instead of all of
+  `target/`.
+
 - Old toolchains with `-toolchains`: rustup, nvm, fnm, volta, pyenv, mise and SDKMAN versions, except the default,
   the one on PATH and any a project pins (`.nvmrc`, `rust-toolchain.toml`, `.tool-versions`, ...).
 

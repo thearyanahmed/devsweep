@@ -118,11 +118,11 @@ fn plan<'a>(root: &Path, arts: &[&'a Artifact], o: &Options) -> Plan<'a> {
             Safety::Caution => false,
             Safety::Safe => true,
             Safety::Unsafe => {
-                p.tracked_jobs.push(job(root, a));
+                p.tracked_jobs.push(job(root, a, o));
                 continue;
             }
         };
-        let argv = job(root, a).argv;
+        let argv = job(root, a, o).argv;
         if !argv.is_empty()
             && let Some(&Slot { in_batch, index }) = by_cmd.get(&(a.project.clone(), argv.clone()))
         {
@@ -147,22 +147,36 @@ fn plan<'a>(root: &Path, arts: &[&'a Artifact], o: &Options) -> Plan<'a> {
             };
             by_cmd.insert((a.project.clone(), argv.clone()), slot);
         }
-        list.push(job(root, a));
+        list.push(job(root, a, o));
     }
     p
 }
 
 /// Cleaning one artifact on its own.
-fn job(root: &Path, a: &Artifact) -> Job {
+fn job(root: &Path, a: &Artifact, o: &Options) -> Job {
     Job {
         label: rel(root, &a.path),
         dir: a.project.clone(),
         argv: match &a.clean {
-            Clean::Tool(argv) => argv.clone(),
+            Clean::Tool(argv) => trimmed(argv, o),
             Clean::RemoveDir | Clean::Blocked(_) => Vec::new(),
         },
         paths: vec![a.path.clone()],
         before: a.bytes,
+    }
+}
+
+/// With -trim, `cargo clean` becomes cargo-sweep removing only the build files not used for that long, so the next
+/// build stays fast; anything else is run as it is.
+fn trimmed(argv: &[String], o: &Options) -> Vec<String> {
+    match o.trim {
+        Some(age) if argv == ["cargo", "clean"] => {
+            let days = (age.as_secs() / 86_400).max(1);
+            ["cargo", "sweep", "--time", &days.to_string()]
+                .map(str::to_owned)
+                .to_vec()
+        }
+        _ => argv.to_vec(),
     }
 }
 
