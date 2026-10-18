@@ -177,6 +177,7 @@ impl Runner {
         if let Err(e) = j.run() {
             eprintln!("  {} {}: {e}", paint("31", "failed"), j.label);
             self.failed = true;
+            return;
         }
         let got = j.before.saturating_sub(size_of(&j.paths));
         self.freed += got;
