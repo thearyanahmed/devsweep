@@ -103,7 +103,6 @@ const FLAGS: &[Flag] = &[
         "volumes",
         "only Docker volumes; with clean, offer each one for removal",
     ),
-    flag("yes", "clean: don't ask before deleting safe artifacts"),
 ];
 
 #[expect(
@@ -115,7 +114,6 @@ pub struct Options {
     pub tree: bool,
     pub json: bool,
     pub caches: bool,
-    pub yes: bool,
     /// --dry-run as given: `None` leaves tool commands running and rm -rf as a dry run.
     pub dry_run: Option<bool>,
     pub caution: bool,
@@ -313,7 +311,6 @@ fn options(set: &BTreeMap<&'static str, String>) -> Options {
         tree: on("tree"),
         json: on("json"),
         caches: on("caches"),
-        yes: on("yes"),
         dry_run: set.get("dry-run").map(|v| v == "true" || v == "1"),
         caution: on("include-caution"),
         rm: on("rm"),

@@ -225,7 +225,7 @@ pub fn run_clean(
             );
         }
         let question = format!("\nRun these {} ({})?", p.batch.len(), human(total));
-        if o.yes || p.batch.iter().all(|j| runner.dry(j)) || ask(&question) {
+        if p.batch.iter().all(|j| runner.dry(j)) || ask(&question) {
             p.batch.iter().for_each(|j| runner.run(j));
         }
     }

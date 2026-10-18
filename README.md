@@ -171,7 +171,6 @@ Output is colored on a terminal and plain otherwise, or with `NO_COLOR` set.
 | `-sort` | `size` (default), `age` or `path` |
 | `-tree` | a tree instead of a table |
 | `-volumes` | only Docker volumes; with clean, offer each one |
-| `-yes` | clean: don't ask before running the safe batch |
 
 ## How it works
 
