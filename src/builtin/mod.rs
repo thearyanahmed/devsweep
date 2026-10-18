@@ -5,9 +5,11 @@ mod cmake;
 mod docker;
 mod elixir;
 mod go;
+mod models;
 mod node;
 mod python;
 mod rust;
+mod simulators;
 mod swift;
 mod zig;
 
@@ -25,5 +27,6 @@ pub(crate) fn register(r: &mut Registry) {
     elixir::register(r);
     cmake::register(r);
     r.add(docker::Docker);
+    r.add(models::Models);
     r.add(caches::Caches);
 }

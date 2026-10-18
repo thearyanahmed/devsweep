@@ -230,7 +230,8 @@ pub(crate) fn run_clean(
     offered: &[(Section, Vec<&Item>)],
     o: &Options,
 ) -> i32 {
-    let root = &roots[0];
+    // Labels are relative to the first folder scanned; with none, to the home folder.
+    let root = &roots.first().cloned().or_else(home).unwrap_or_default();
     let p = plan(root, arts, o);
     let mut runner = Runner {
         dry_run: o.dry_run,

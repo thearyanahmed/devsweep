@@ -3,7 +3,7 @@ use std::thread;
 
 use serde::Serialize;
 
-use super::docker;
+use super::{docker, simulators};
 use crate::cmd::{on_path, output};
 use crate::scan::measure_all;
 use crate::sweep::{Clean, Item, Safety, Section, Sweeper, exists};
@@ -295,6 +295,13 @@ fn editors(h: &Home) -> Vec<Cache> {
     vec![
         cache("android cache", h.at(".android/cache"), &[]),
         cache(
+            "minikube",
+            h.at(".minikube"),
+            &["minikube", "delete", "--all", "--purge"],
+        )
+        .caution()
+        .note("deletes every minikube cluster along with its downloads"),
+        cache(
             "jetbrains caches",
             h.os("Library/Caches/JetBrains", ".cache/JetBrains"),
             &[],
@@ -365,7 +372,8 @@ impl Sweeper for Caches {
     }
 
     fn list(&self) -> Vec<Item> {
-        caches()
+        let runtimes = thread::spawn(simulators::runtimes);
+        let mut items: Vec<Item> = caches()
             .into_iter()
             .map(|c| Item {
                 path: (!c.path.as_os_str().is_empty()).then_some(c.path),
@@ -374,6 +382,8 @@ impl Sweeper for Caches {
                 note: c.note.to_owned(),
                 ..Item::new("cache", c.name, c.cmd.map_or(Clean::RemoveDir, Clean::Tool))
             })
-            .collect()
+            .collect();
+        items.extend(runtimes.join().unwrap_or_default());
+        items
     }
 }

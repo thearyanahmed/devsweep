@@ -75,6 +75,10 @@ const FLAGS: &[Flag] = &[
         "1M",
         "hide artifacts smaller than this, e.g. 100M, 1G",
     ),
+    flag(
+        "models",
+        "only local AI models (Ollama, LM Studio); with clean, offer each one for removal",
+    ),
     string(
         "older",
         "",
@@ -82,7 +86,7 @@ const FLAGS: &[Flag] = &[
     ),
     flag(
         "pwd",
-        "the current folder instead of ~/dev, as if given as a folder",
+        "the current folder instead of the default ones, as if given as a folder",
     ),
     flag(
         "rm",
@@ -119,7 +123,6 @@ pub(crate) struct Options {
     /// -detailed: the tree shows everything the table does.
     pub(crate) detailed: bool,
     pub(crate) json: bool,
-    pub(crate) caches: bool,
     /// --dry-run as given: `None` leaves tool commands running and rm -rf as a dry run.
     pub(crate) dry_run: Option<bool>,
     /// -upto: the least safe artifacts clean offers.
@@ -127,8 +130,6 @@ pub(crate) struct Options {
     pub(crate) rm: bool,
     /// -y: clean answers its own questions.
     pub(crate) yes: bool,
-    pub(crate) volumes: bool,
-    pub(crate) images: bool,
     /// -group image: Docker's containers and volumes under the image they come from.
     pub(crate) by_image: bool,
     pub(crate) older: Option<Duration>,
@@ -141,17 +142,14 @@ pub(crate) struct Options {
     pub(crate) scoped: bool,
     /// The string flags as given, for saying which ones hid artifacts.
     raw: BTreeMap<&'static str, String>,
+    /// The switches given, for the sections a flag of their own lists: -images, -models.
+    switches: HashSet<&'static str>,
 }
 
 impl Options {
     /// Whether the flag a section names was given.
     fn flag_on(&self, flag: Option<&str>) -> bool {
-        match flag {
-            Some("caches") => self.caches,
-            Some("images") => self.images,
-            Some("volumes") => self.volumes,
-            _ => false,
-        }
+        flag.is_some_and(|f| self.switches.contains(f))
     }
 }
 
@@ -179,7 +177,7 @@ fn help() -> String {
         bold("devsweep"),
         dim(": what your projects' build output is costing you, and cleaning it up."),
         bold("Usage:"),
-        dim("list artifacts (default dir: ~/dev)"),
+        dim("list artifacts (default: ~/dev, ~/code, ~/projects, ~/src, ~/Developer)"),
         dim("clean them, after asking"),
         dim(
             "Cleaning runs each tool's own command in the project (cargo clean, mix clean, swift package reset, npm run \
@@ -335,7 +333,6 @@ fn options(set: &BTreeMap<&'static str, String>) -> Options {
         tree: on("tree"),
         detailed: on("detailed"),
         json: on("json"),
-        caches: on("caches"),
         dry_run: set.get("dry-run").map(|v| v == "true" || v == "1"),
         upto: match get("upto").as_str() {
             "safe" => Safety::Safe,
@@ -345,8 +342,6 @@ fn options(set: &BTreeMap<&'static str, String>) -> Options {
         },
         rm: on("rm"),
         yes: on("y"),
-        volumes: on("volumes"),
-        images: on("images"),
         by_image: get("group") == "image",
         older: (!older.is_empty()).then(|| parse_age(&older).unwrap_or_else(|e| fail(e))),
         min: parse_size(&get("min")).unwrap_or_else(|e| fail(e)),
@@ -366,25 +361,72 @@ fn options(set: &BTreeMap<&'static str, String>) -> Options {
             .into_iter()
             .map(|n| (n, get(n)))
             .collect(),
+        switches: set.keys().copied().filter(|&n| on(n)).collect(),
     }
 }
 
-/// The dirs to scan as absolute paths, ~/dev when none are given; exits if one isn't a directory.
+/// Where projects usually live, scanned when no folders are named: whichever of these exist under the home folder.
+const DEFAULT_ROOTS: &[&str] = &["dev", "code", "projects", "src", "Developer"];
+
+/// The folders to scan as absolute paths. Named ones must be folders devsweep can read, or it exits saying which and
+/// why; with none named, the [`DEFAULT_ROOTS`] that exist, which may be none.
 fn resolve_roots(dirs: &[String]) -> Vec<PathBuf> {
-    let dirs = if dirs.is_empty() {
-        vec![Path::new(&std::env::var_os("HOME").unwrap_or_default()).join("dev")]
-    } else {
-        dirs.iter().map(PathBuf::from).collect()
-    };
+    if dirs.is_empty() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        return DEFAULT_ROOTS
+            .iter()
+            .map(|d| home.join(d))
+            .filter(|d| readable(d).is_ok())
+            .collect();
+    }
     dirs.iter()
         .map(|d| {
-            let abs = normalize(&std::path::absolute(d).unwrap_or_else(|e| fail(e)));
-            if !abs.is_dir() {
-                fail(format!("{}: not a directory", d.display()));
+            let abs =
+                normalize(&std::path::absolute(d).unwrap_or_else(|e| fail(format!("{d}: {e}"))));
+            if let Err(why) = readable(&abs) {
+                fail(format!("{d}: {why}"));
             }
             abs
         })
         .collect()
+}
+
+/// Whether `dir` is a folder devsweep can list, and if not, why in words.
+fn readable(dir: &Path) -> Result<(), String> {
+    match std::fs::metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err("no such folder".into()),
+        Err(e) => return Err(access(&e)),
+        Ok(m) if !m.is_dir() => return Err("not a folder".into()),
+        Ok(_) => {}
+    }
+    std::fs::read_dir(dir).map(drop).map_err(|e| access(&e))
+}
+
+/// An error opening a folder, in words. macOS's privacy settings refuse with EPERM rather than EACCES: they keep
+/// ~/Desktop, ~/Documents, ~/Downloads and others from a terminal until it's given access.
+fn access(e: &std::io::Error) -> String {
+    const EPERM: i32 = 1;
+    if cfg!(target_os = "macos") && e.raw_os_error() == Some(EPERM) {
+        return "macOS keeps it from your terminal: allow it in System Settings > Privacy & Security > Files and \
+                Folders, or Full Disk Access"
+            .into();
+    }
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        return "devsweep can't read it (permission denied)".into();
+    }
+    e.to_string()
+}
+
+/// Says why nothing was scanned when no folders were named and none of the usual ones exist.
+fn no_roots_note() {
+    let tried: Vec<String> = DEFAULT_ROOTS.iter().map(|d| format!("~/{d}")).collect();
+    println!(
+        "{}",
+        dim(&format!(
+            "no project folders: none of {} exists; name the folders that hold yours, e.g. devsweep ~/work",
+            tried.join(", ")
+        ))
+    );
 }
 
 /// Runs devsweep with the command line it was started with, and exits.
@@ -430,6 +472,9 @@ pub fn run(registry: &Registry) {
     let shown = filter(&all, &o);
 
     if clean {
+        if roots.is_empty() {
+            no_roots_note();
+        }
         let offered: Vec<(Section, Vec<&Item>)> = sections
             .iter()
             .filter(|sec| sec.listed && (sec.flag.is_none() || o.flag_on(sec.flag)))
@@ -598,6 +643,10 @@ fn print_json(roots: &[PathBuf], shown: &[&Artifact], items: &[Item]) {
 
 /// The summary, then each root's artifacts as a table or a tree, grouped as asked.
 fn print_listing(roots: &[PathBuf], all: &[Artifact], shown: &[&Artifact], o: &Options) {
+    if roots.is_empty() {
+        no_roots_note();
+        return;
+    }
     // The summary heads the listing: the note and the table or tree follow it directly.
     summary(roots, shown);
     if all.is_empty() {
@@ -778,6 +827,17 @@ mod tests {
             ArgError::Unknown("-nope".into())
         );
         assert_eq!(parse(&["--help"]).unwrap_err(), ArgError::Help);
+    }
+
+    #[test]
+    fn named_folders_must_be_readable_folders() {
+        let dir = std::env::temp_dir().join(format!("devsweep-readable-{}", process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file"), "").unwrap();
+        assert_eq!(readable(&dir), Ok(()));
+        assert_eq!(readable(&dir.join("file")), Err("not a folder".into()));
+        assert_eq!(readable(&dir.join("nope")), Err("no such folder".into()));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -7,6 +7,10 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- With no folders named, devsweep scans whichever of `~/dev`, `~/code`, `~/projects`, `~/src` and `~/Developer` exist,
+  instead of failing when there's no `~/dev`. Named folders are checked first: a missing, unreadable or
+  macOS-protected one stops devsweep with the reason.
+
 - `--include-caution` is replaced by `-upto safe|caution|unsafe`. `-upto unsafe` can clean folders git tracks files
   in: one by one, each confirmed by typing its name (never by `-y`), and only with no uncommitted changes in it.
 
@@ -16,6 +20,12 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rebuild command and why it isn't safe.
 
 ### Added
+
+- Local AI models: each Ollama model (removed with `ollama rm`) and LM Studio's models folder, listed after Docker;
+  `-models` lists only them, and with `clean` offers each one.
+- Xcode simulator runtimes with `-caches`, removed with `xcrun simctl runtime delete`; the newest per platform is
+  never offered.
+- minikube with `-caches`, removed with `minikube delete --all --purge`.
 
 - `clean -y` answers yes to every question. What is offered still follows the other flags, and `rm -rf` stays a dry
   run unless `--dry-run=false`.

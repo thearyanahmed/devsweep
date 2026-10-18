@@ -6,6 +6,18 @@ with each tool's own command, asking first.
 
 ![devsweep listing ~/dev as a table and as a tree, then Docker images](images/devsweep.png)
 
+## Why devsweep
+
+[kondo](https://github.com/tbillington/kondo) and [npkill](https://github.com/voidcosmos/npkill) find build folders and
+delete them. devsweep goes further on what a developer's disk actually holds, and on not losing anything:
+
+- **Git decides what's safe.** A folder with tracked files is never cleaned by default; one git doesn't ignore is
+  asked about one by one.
+- **Each tool cleans its own mess.** `cargo clean`, `mix clean`, `swift package reset`, `npm run clean`; `rm -rf` only
+  for what no tool removes, and only for real with `--dry-run=false`.
+- **Beyond project folders.** Docker images and volumes (with shared layers counted once), local AI models, Xcode's
+  simulator runtimes, and about 50 tool caches.
+
 ## Install
 
 Needs Rust 1.88 or newer. macOS or Linux; Docker is optional.
@@ -24,7 +36,7 @@ make build      # or just build ./devsweep
 ## Usage
 
 ```sh
-devsweep                          # everything under ~/dev, then Docker's images and volumes
+devsweep                          # your code folders (~/dev, ~/code, ...), then Docker and local models
 devsweep ~/dev ~/work             # only these folders, any number; Docker left out
 devsweep -pwd                     # the folder you are in
 devsweep -tree                    # the same as a tree of folders: size, safety, clean command
@@ -34,6 +46,7 @@ devsweep -sort age:asc            # most recently built first; size, age, path, 
 devsweep -older 30d -kind rust    # only Rust projects not built for a month
 devsweep -caches                  # also the shared caches: cargo, go, npm, pnpm, brew, ...
 devsweep -images -volumes         # only Docker
+devsweep -models                  # only local AI models: Ollama, LM Studio
 devsweep -json                    # everything, for scripts
 
 devsweep clean --dry-run          # what clean would run, running nothing
@@ -43,6 +56,11 @@ devsweep clean -pwd -y            # the same, answering yes to every question
 devsweep clean -caches -images    # also offers caches and Docker images, one by one
 devsweep clean -upto caution      # also caution artifacts (dist/, no lockfile), one by one
 ```
+
+With no folders named, devsweep scans whichever of `~/dev`, `~/code`, `~/projects`, `~/src` and `~/Developer` exist.
+A folder you name must exist and be readable, or devsweep stops and says which and why. On macOS that includes
+`~/Desktop`, `~/Documents` and `~/Downloads`, which your terminal needs access to in System Settings > Privacy &
+Security.
 
 Flags go before or after the folders. One-word flags take one dash (`-tree`), several words two (`--dry-run`); a
 one-word flag also takes two. `-h` lists them all.
@@ -147,6 +165,16 @@ devsweep goes through the `docker` command, so it asks whichever engine the curr
 OrbStack, Colima. With Docker missing or stopped, the Docker part is simply left out; a Docker that doesn't answer
 within 5 seconds is skipped.
 
+## Local models
+
+Downloaded AI models are listed after Docker, as caution: one is often 4 to 40 GB and slow to fetch again.
+
+- **Ollama**: each model `ollama list` names, removed with `ollama rm`. Models share layers, so removing one can free
+  less than its size. With Ollama not running, its models folder (`~/.ollama/models` or `$OLLAMA_MODELS`) as a whole.
+- **LM Studio**: its models folder, `~/.lmstudio/models` or the older `~/.cache/lm-studio/models`, removed with rm -rf.
+
+`-models` lists only them, and with `clean` offers each one. Like Docker, they're left out when you name folders.
+
 ## Shared caches
 
 `-caches` adds the tool-wide caches outside any project, refilled on demand; only the ones present are listed, and on
@@ -171,7 +199,9 @@ the tool's own command where it has one:
 | Xcode derived data, documentation cache, device logs, iOS and watchOS device support | rm -rf |
 | Xcode archives (caution: the dSYMs for your shipped builds' crash reports) | rm -rf |
 | Simulator caches and logs, unavailable iOS simulators | rm -rf, `xcrun simctl delete unavailable` |
+| Simulator runtimes (caution; the newest per platform, which Xcode uses, is never offered) | `xcrun simctl runtime delete` |
 | Android SDK cache | rm -rf |
+| minikube (caution: every cluster) | `minikube delete --all --purge` |
 | JetBrains IDEs, VS Code and Cursor cached data, VS Code extension downloads | rm -rf (quit the editor first) |
 | Electron, electron-builder downloads | rm -rf |
 | Docker's reclaimable space | `docker system prune -f` (caution) |
@@ -201,9 +231,10 @@ Output is colored on a terminal and plain otherwise, or with `NO_COLOR` set.
 | `-images` | only Docker images; with clean, offer each one |
 | `-json` | print JSON |
 | `-kind` | only these kinds, comma separated: `rust,node,go,python,swift,zig,elixir,cmake`, or any sweeper you add |
+| `-models` | only local AI models (Ollama, LM Studio); with clean, offer each one |
 | `-min` | hide artifacts smaller than this, e.g. `100M`, `1G` (default `1M`) |
 | `-older` | only artifacts not built for this long, e.g. `14d`, `3w`, `2mo`, `12h` |
-| `-pwd` | the current folder instead of `~/dev`, as if named; with folders, it is added to them |
+| `-pwd` | the current folder instead of the default ones, as if named; with folders, it is added to them |
 | `-rm` | clean: also offer what only rm -rf removes (`node_modules`, `.next`, ...) |
 | `-sort` | `size` (default), `age` or `path`, optionally with `:asc` or `:desc` |
 | `-tree` | a tree instead of a table: each artifact's size, safety and clean command |
