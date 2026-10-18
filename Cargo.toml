@@ -10,7 +10,7 @@ repository = "https://github.com/thearyanahmed/devsweep"
 readme = "README.md"
 keywords = ["disk", "cleanup", "cargo", "node-modules", "docker"]
 categories = ["command-line-utilities", "development-tools", "filesystem"]
-exclude = ["/.github", "/Makefile"]
+exclude = ["/.github", "/Makefile", "/images"]
 # Not on crates.io yet; drop this line to publish.
 publish = false
 

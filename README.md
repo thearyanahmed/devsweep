@@ -4,15 +4,7 @@ Build output and Docker quietly eat a disk: a `target/` per Rust project, a `nod
 volumes nobody remembers. devsweep shows what is taking the space, whether each piece is safe to remove, and cleans it
 with each tool's own command, asking first.
 
-```
-~/dev  7 artifacts in 5 projects, 3.1 GiB safe  5.8 MiB caution  0 B unsafe
-4 artifacts (520.0 KiB) hidden by -min 1M; newest built 3h ago
-SIZE       SAFETY   KIND  PROJECT                          DIR           LAST BUILT  CLEAN WITH           REBUILD WITH
-1.1 GiB    safe     rust  paperkites/kites/backend         target        3h ago      cargo clean          cargo build
-909.1 MiB  safe     rust  paperkites/kites-purchase        target        3h ago      cargo clean          cargo build
-882.7 MiB  safe     node  paperkites/kites                 node_modules  3h ago      rm -rf node_modules  pnpm install
-5.8 MiB    caution  node  thearyanahmed/thearyanahmed.com  dist          1m ago      rm -rf dist          the project's build script
-```
+![devsweep listing ~/dev as a table and as a tree, then Docker images](images/devsweep.png)
 
 ## Install
 
