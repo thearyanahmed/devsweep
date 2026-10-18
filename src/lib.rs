@@ -13,5 +13,6 @@ mod cmd;
 mod output;
 mod scan;
 pub mod sweep;
+mod why;
 
 pub use scan::{Artifact, scan};

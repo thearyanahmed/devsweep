@@ -21,6 +21,9 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `devsweep why`: the disk's size and free space, what devsweep can reclaim by part with the command for each, what
+  Docker's VM disk takes against what Docker counts in use, and Time Machine's local snapshots.
+
 - Local AI models: each Ollama model (removed with `ollama rm`) and LM Studio's models folder, listed after Docker;
   `-models` lists only them, and with `clean` offers each one.
 - Xcode simulator runtimes with `-caches`, removed with `xcrun simctl runtime delete`; the newest per platform is

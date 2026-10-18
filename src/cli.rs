@@ -163,6 +163,7 @@ fn help() -> String {
 {}
   devsweep [flags] [dirs...]         {}
   devsweep clean [flags] [dirs...]   {}
+  devsweep why [dirs...]             {}
 
 {}{}{}{}{}{}{}
 
@@ -179,6 +180,7 @@ fn help() -> String {
         bold("Usage:"),
         dim("list artifacts (default: ~/dev, ~/code, ~/projects, ~/src, ~/Developer)"),
         dim("clean them, after asking"),
+        dim("where the disk went: free space, what devsweep can reclaim, Docker's VM disk"),
         dim(
             "Cleaning runs each tool's own command in the project (cargo clean, mix clean, swift package reset, npm run \
              clean,\ngo clean -cache, brew cleanup, docker system prune, ...). Things no tool can clean (node_modules, \
@@ -437,7 +439,8 @@ fn no_roots_note() {
 pub fn run(registry: &Registry) {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let clean = args.first().is_some_and(|a| a == "clean");
-    if clean {
+    let why = args.first().is_some_and(|a| a == "why");
+    if clean || why {
         args.remove(0);
     }
     let Args { set, mut dirs } = match parse_args(&args) {
@@ -454,6 +457,11 @@ pub fn run(registry: &Registry) {
         dirs.push(".".to_owned());
     }
     o.scoped = !dirs.is_empty();
+    // Where the disk went takes in everything devsweep can find, not just what the listing shows by default.
+    if why {
+        o.switches.insert("caches");
+        o.scoped = false;
+    }
     let roots = resolve_roots(&dirs);
     if clean && let Err(why) = clean::preflight(&roots) {
         fail(why);
@@ -463,6 +471,7 @@ pub fn run(registry: &Registry) {
     // A flag for a section listed anyway (-images) lists only it; one for a section that waits to be asked (-caches)
     // adds it to everything else.
     let only = !clean
+        && !why
         && !o.json
         && registry
             .listers()
@@ -471,6 +480,10 @@ pub fn run(registry: &Registry) {
     let (all, items) = gather(registry, &roots, &o, clean, only);
     let shown = filter(&all, &o);
 
+    if why {
+        crate::why::report(&roots, &all, &items);
+        return;
+    }
     if clean {
         if roots.is_empty() {
             no_roots_note();

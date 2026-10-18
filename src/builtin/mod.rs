@@ -13,6 +13,8 @@ mod simulators;
 mod swift;
 mod zig;
 
+pub(crate) use docker::VmDisk;
+
 use crate::sweep::Registry;
 
 /// Adds every built-in sweeper. Order matters only where two claim the same folder name: Node's `build` (beside a
@@ -29,4 +31,14 @@ pub(crate) fn register(r: &mut Registry) {
     r.add(docker::Docker);
     r.add(models::Models);
     r.add(caches::Caches);
+}
+
+/// The VM disks of the Docker engines installed, for `devsweep why`.
+pub(crate) fn docker_vm_disks() -> Vec<VmDisk> {
+    docker::vm_disks()
+}
+
+/// What Docker says its images, containers, volumes and build cache take, for `devsweep why`.
+pub(crate) fn docker_in_use() -> Option<u64> {
+    docker::total_size()
 }

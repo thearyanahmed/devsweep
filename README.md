@@ -49,6 +49,8 @@ devsweep -images -volumes         # only Docker
 devsweep -models                  # only local AI models: Ollama, LM Studio
 devsweep -json                    # everything, for scripts
 
+devsweep why                      # where the disk went, on one screen
+
 devsweep clean --dry-run          # what clean would run, running nothing
 devsweep clean                    # runs the safe tool commands after one yes
 devsweep clean -pwd               # only the project or folder you are in
@@ -135,6 +137,30 @@ Some things it refuses outright, whatever a sweeper says:
 - `/` or your home folder as a folder to scan;
 - an `rm -rf` of anything but a real folder (not a symlink) strictly inside a scanned folder or your home folder,
   never one of those itself, checked again right before deleting.
+
+## Where the disk went
+
+`devsweep why` answers "where did my disk go" on one screen:
+
+```
+Disk  228.2 GiB, 80.2 GiB used, 148.0 GiB free
+
+Reclaimable  2.9 GiB  (2.8 GiB of it safe)
+  511.5 MiB   projects in ~/dev        435.0 MiB safe; devsweep clean -rm -upto caution
+  2.4 GiB     shared caches            2.4 GiB safe; devsweep clean -caches
+```
+
+- **Disk**: the size, used and free space of the disk your home folder is on.
+- **Reclaimable**: everything devsweep can clean, safe and caution (never unsafe), by part, each with the command that
+  cleans it: projects, Docker images and volumes, local models and the shared caches, all counted whether or not
+  their flag was given.
+- **Docker's VM disk**: Docker Desktop, OrbStack, Colima and Rancher Desktop keep containers in one disk image.
+  Pruning frees space inside it, which isn't always given back to macOS: devsweep shows what the image takes on disk
+  and, with one engine, how much more that is than what Docker counts in use.
+- **Local snapshots**: how many Time Machine keeps on the disk. Their size needs root to read; macOS deletes them on
+  its own when space runs low.
+
+What isn't explained (apps, your own files, macOS's "System Data") is the rest of the used space.
 
 ## Docker
 

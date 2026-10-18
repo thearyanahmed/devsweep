@@ -2,6 +2,7 @@
 //! through the `docker` command, so whichever engine its current context points at (Docker Desktop, `OrbStack`,
 //! Colima) is the one asked.
 
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -70,6 +71,74 @@ fn docker(args: &'static [&'static str]) -> Option<String> {
 pub(super) fn reclaimable() -> u64 {
     docker(&["system", "df", "--format", "{{.Reclaimable}}"])
         .map_or(0, |out| out.lines().filter_map(|l| size(l.trim())).sum())
+}
+
+/// What `docker system df` says images, containers, volumes and the build cache take; `None` when Docker isn't
+/// running.
+pub(super) fn total_size() -> Option<u64> {
+    docker(&["system", "df", "--format", "{{.Size}}"])
+        .map(|out| out.lines().filter_map(|l| size(l.trim())).sum())
+}
+
+/// The folder a Docker engine keeps its VM's disk in, and how much of the Mac's disk that takes.
+#[derive(Debug)]
+pub(crate) struct VmDisk {
+    pub engine: &'static str,
+    pub path: PathBuf,
+    /// What its files take on disk: disk images are sparse, so less than their length. Why not, when the folder
+    /// can't be read.
+    pub allocated: Result<u64, String>,
+}
+
+/// The VM disks of the engines installed: Docker Desktop, `OrbStack`, Colima and Rancher Desktop. Pruning frees space
+/// inside them, which isn't always given back to macOS.
+pub(super) fn vm_disks() -> Vec<VmDisk> {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let mut found = vec![
+        (
+            "Docker Desktop",
+            home.join("Library/Containers/com.docker.docker/Data/vms/0/data"),
+        ),
+        (
+            "OrbStack",
+            home.join("Library/Group Containers/HUAQ24HBR6.dev.orbstack/data"),
+        ),
+        (
+            "Rancher Desktop",
+            home.join("Library/Application Support/rancher-desktop/lima/0"),
+        ),
+    ];
+    // Colima keeps one VM per profile.
+    if let Ok(profiles) = std::fs::read_dir(home.join(".colima/_lima")) {
+        found.extend(profiles.flatten().map(|p| ("Colima", p.path())));
+    }
+    found
+        .into_iter()
+        .filter(|(_, path)| path.is_dir())
+        .map(|(engine, path)| VmDisk {
+            engine,
+            allocated: files_size(&path),
+            path,
+        })
+        .collect()
+}
+
+/// What the files directly in `dir` take on disk.
+fn files_size(dir: &std::path::Path) -> Result<u64, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            "macOS keeps the folder from your terminal; Full Disk Access lets it read it".to_owned()
+        } else {
+            e.to_string()
+        }
+    })?;
+    Ok(entries
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(std::fs::Metadata::is_file)
+        .map(|m| m.blocks() * 512)
+        .sum())
 }
 
 /// Docker's images, containers and volumes, each biggest first (then by name). Empty when Docker isn't installed or
