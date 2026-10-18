@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use crate::caches::Cache;
-use crate::docker::Volume;
+use crate::docker::{Container, Image, Removable, Snapshot, User, Volume};
 use crate::rules::Safety;
 use crate::scan::Artifact;
 
@@ -486,44 +486,143 @@ pub fn print_caches(cs: &mut [Cache]) {
     t.print();
 }
 
+/// The containers using something, each with its state.
+fn users(used_by: &[User]) -> String {
+    if used_by.is_empty() {
+        return dim("-");
+    }
+    used_by
+        .iter()
+        .map(|c| {
+            format!(
+                "{} {}",
+                c.name,
+                dim(if c.running { "running" } else { "stopped" })
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// How to remove it, or what's in the way.
+fn clean_with(r: &impl Removable) -> String {
+    dim(&r
+        .clean_cmd()
+        .map_or_else(|| r.blocker(), |argv| argv.join(" ")))
+}
+
+/// An image's own size, and the layers it shares with other images, which removing it doesn't free.
+fn image_size(i: &Image) -> String {
+    if i.shared > 0 {
+        format!(
+            "{}{}",
+            human(i.bytes),
+            dim(&format!(" +{} shared", human(i.shared)))
+        )
+    } else {
+        human(i.bytes)
+    }
+}
+
+/// Docker's images: who uses each, and whether removing it is wise.
+pub fn print_images(images: &[Image]) {
+    let total: u64 = images.iter().map(|i| i.bytes).sum();
+    println!(
+        "{}  {}  {}",
+        bold("Docker images"),
+        human(total),
+        dim("(shared layers counted once; devsweep clean -images offers each one)")
+    );
+    let mut t = Table::new(&["SIZE", "SAFETY", "IMAGE", "USED BY", "CLEAN WITH"], 0);
+    for i in images {
+        t.row(vec![
+            image_size(i),
+            safety_label(i.safety),
+            i.name.clone(),
+            users(&i.used_by),
+            clean_with(i),
+        ]);
+    }
+    t.print();
+}
+
 /// Docker's volumes: who uses each, and whether removing it is wise.
-pub fn print_volumes(volumes: &[Volume]) {
+pub fn print_volumes(volumes: &[&Volume], title: &str) {
     let total: u64 = volumes.iter().map(|v| v.bytes).sum();
     println!(
         "{}  {}  {}",
-        bold("Docker volumes"),
+        bold(title),
         human(total),
         dim("(data containers wrote; devsweep clean -volumes offers each one)")
     );
     let mut t = Table::new(&["SIZE", "SAFETY", "VOLUME", "USED BY", "CLEAN WITH"], 0);
     for v in volumes {
-        let used_by = if v.containers.is_empty() {
-            dim("-")
-        } else {
-            v.containers
-                .iter()
-                .map(|c| {
-                    format!(
-                        "{} {}",
-                        c.name,
-                        dim(if c.running { "running" } else { "stopped" })
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let clean = dim(&v
-            .clean_cmd()
-            .map_or_else(|| v.blocker(), |argv| argv.join(" ")));
         t.row(vec![
             human(v.bytes),
             safety_label(v.safety),
             v.name.clone(),
-            used_by,
-            clean,
+            users(&v.used_by),
+            clean_with(*v),
         ]);
     }
     t.print();
+}
+
+/// Docker arranged by image: each image, the containers made from it, and the volumes those use. Volumes no container
+/// uses follow on their own.
+pub fn print_docker_by_image(d: &Snapshot) {
+    let volume_size = |name: &str| {
+        d.volumes
+            .iter()
+            .find(|v| v.name == name)
+            .map_or(0, |v| v.bytes)
+    };
+    let mut t = Table::new(&["CONTAINER", "STATE", "SIZE", "VOLUMES"], 2);
+    for i in &d.images {
+        let shown = if i.name == "<none>" {
+            i.id.as_str()
+        } else {
+            i.name.as_str()
+        };
+        let made: Vec<&Container> = d.containers.iter().filter(|c| c.image == shown).collect();
+        let about = if made.is_empty() {
+            i.why.clone()
+        } else {
+            plural(made.len(), "container")
+        };
+        t.line(format!(
+            "{}  {}  {}  {}",
+            bold(shown),
+            image_size(i),
+            safety_label(i.safety),
+            dim(&about)
+        ));
+        for c in made {
+            let volumes = c
+                .volumes
+                .iter()
+                .map(|v| format!("{v} {}", dim(&human(volume_size(v)))))
+                .collect::<Vec<_>>()
+                .join(", ");
+            t.row(vec![
+                c.name.clone(),
+                dim(if c.running { "running" } else { "stopped" }),
+                human(c.bytes),
+                if volumes.is_empty() {
+                    dim("-")
+                } else {
+                    volumes
+                },
+            ]);
+        }
+    }
+    println!("{}", bold("Docker by image"));
+    t.print();
+    let loose: Vec<&Volume> = d.volumes.iter().filter(|v| v.used_by.is_empty()).collect();
+    if !loose.is_empty() {
+        println!();
+        print_volumes(&loose, "Docker volumes no container uses");
+    }
 }
 
 pub fn notes(n: &str) -> String {

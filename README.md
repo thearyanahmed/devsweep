@@ -33,10 +33,14 @@ Some things have no tool command (`node_modules`, `.next`, `__pycache__`, `.venv
 `rm -rf` and are left alone unless you pass `-rm`, and even then `rm -rf` only shows what it would delete until you
 also pass `--dry-run=false`. Tool commands like `cargo clean` run without it.
 
-Docker volumes are listed too, after the projects (`-volumes` shows only them), with the containers using each. One
-a running container uses is unsafe; any other is caution, since volumes hold data. Docker only removes a volume no
-container uses, so `devsweep clean -volumes` offers just those, one by one, and names the containers in the way of the
-rest. It never removes a container.
+Docker is listed too, after the projects: its images and its volumes, each with the containers using it (`-images`
+or `-volumes` shows only those). An image's size is the layers only it has; layers shared with other images are shown
+apart, since removing it doesn't free them. Anything a running container uses is unsafe. A dangling image (`<none>`,
+an old build) is safe; any other image is caution, since a re-pull or rebuild may differ, and so is every volume, since
+volumes hold data. Docker only removes an image or volume no container uses, so `devsweep clean -images` and
+`clean -volumes` offer just those, one by one, and name the containers in the way of the rest. It never removes a
+container. `-group image` shows Docker by image instead: each image, its containers with their state and size, and
+the volumes they use.
 
 `-group project`, `-group kind` or `-group safety` groups the listing, under a heading per group with its size.
 

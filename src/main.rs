@@ -17,7 +17,8 @@ use std::time::{Duration, SystemTime};
 
 use output::{
     Group, Order, SortBy, ago, bold, dim, group_heading, groups, human, plural, print_caches,
-    print_list, print_tree, print_volumes, reset, safety_label, summary, tilde,
+    print_docker_by_image, print_images, print_list, print_tree, print_volumes, reset,
+    safety_label, summary, tilde,
 };
 use rules::Safety;
 use scan::Artifact;
@@ -63,7 +64,15 @@ const FLAGS: &[Flag] = &[
         "include-caution",
         "clean: also offer caution artifacts, each asked one by one",
     ),
-    string("group", "", "group the listing by project, kind or safety"),
+    string(
+        "group",
+        "",
+        "group the listing by project, kind or safety; image arranges Docker by image",
+    ),
+    flag(
+        "images",
+        "only Docker images; with clean, offer each one for removal",
+    ),
     flag("json", "print JSON"),
     string(
         "kind",
@@ -112,6 +121,9 @@ pub struct Options {
     pub caution: bool,
     pub rm: bool,
     pub volumes: bool,
+    pub images: bool,
+    /// -group image: Docker's containers and volumes under the image they come from.
+    pub by_image: bool,
     pub older: Option<Duration>,
     pub min: u64,
     pub kinds: Option<HashSet<String>>,
@@ -306,6 +318,8 @@ fn options(set: &BTreeMap<&'static str, String>) -> Options {
         caution: on("include-caution"),
         rm: on("rm"),
         volumes: on("volumes"),
+        images: on("images"),
+        by_image: get("group") == "image",
         older: (!older.is_empty()).then(|| parse_age(&older).unwrap_or_else(|e| fail(e))),
         min: parse_size(&get("min")).unwrap_or_else(|e| fail(e)),
         kinds: (!kinds.is_empty()).then(|| kinds.split(',').map(|k| k.trim().to_owned()).collect()),
@@ -319,11 +333,13 @@ fn options(set: &BTreeMap<&'static str, String>) -> Options {
             reverse: on("reverse"),
         },
         group: match get("group").as_str() {
-            "" => None,
+            "" | "image" => None,
             "project" => Some(Group::Project),
             "kind" => Some(Group::Kind),
             "safety" => Some(Group::Safety),
-            other => fail(format!("bad -group {other:?}: use project, kind or safety")),
+            other => fail(format!(
+                "bad -group {other:?}: use project, kind, safety or image"
+            )),
         },
         raw: ["older", "kind", "min"]
             .into_iter()
@@ -368,43 +384,37 @@ fn main() {
     let o = options(&set);
     let roots = resolve_roots(&dirs);
 
-    // -volumes on its own: just Docker's volumes, no scan.
-    if o.volumes && !clean && !o.json {
-        let volumes = docker::volumes();
-        if volumes.is_empty() {
-            println!("{}", dim("no Docker volumes (or Docker isn't running)"));
-        } else {
-            print_volumes(&volumes);
-        }
+    // -images or -volumes on their own: just Docker, no scan.
+    if (o.images || o.volumes) && !clean && !o.json {
+        print_docker(&docker::snapshot(), &o, true);
         return;
     }
 
-    // Shared caches and Docker's volumes don't depend on the projects: look them up at the same time.
+    // Shared caches and Docker don't depend on the projects: look them up at the same time.
     let pending_caches = o.caches.then(|| std::thread::spawn(caches::caches));
     let caches = move || pending_caches.map(|t| t.join().expect("the cache thread panicked"));
-    let pending_volumes = (!clean || o.volumes).then(|| std::thread::spawn(docker::volumes));
-    let volumes = move || {
-        pending_volumes.map_or_else(Vec::new, |t| t.join().expect("the docker thread panicked"))
+    let pending_docker =
+        (!clean || o.images || o.volumes).then(|| std::thread::spawn(docker::snapshot));
+    let docker = move || {
+        pending_docker.map_or_else(docker::Snapshot::default, |t| {
+            t.join().expect("the docker thread panicked")
+        })
     };
     let all = scan::scan(&roots);
     let shown = filter(&all, &o);
 
     if clean {
         let caches = caches().unwrap_or_default();
-        let volumes = volumes();
-        process::exit(clean::run_clean(&roots, &shown, &caches, &volumes, &o));
+        let docker = docker();
+        process::exit(clean::run_clean(&roots, &shown, &caches, &docker, &o));
     }
 
     if o.json {
-        print_json(&roots, &shown, caches(), volumes());
+        print_json(&roots, &shown, caches(), docker());
         return;
     }
     print_listing(&roots, &all, &shown, &o);
-    let volumes = volumes();
-    if !volumes.is_empty() {
-        println!();
-        print_volumes(&volumes);
-    }
+    print_docker(&docker(), &o, false);
     if o.caches {
         print_caches(&mut caches().unwrap_or_default());
     }
@@ -414,7 +424,7 @@ fn print_json(
     roots: &[PathBuf],
     shown: &[&Artifact],
     caches: Option<Vec<caches::Cache>>,
-    volumes: Vec<docker::Volume>,
+    docker: docker::Snapshot,
 ) {
     // Keys in the order Go's encoding/json gives a map: sorted.
     #[derive(serde::Serialize)]
@@ -423,18 +433,48 @@ fn print_json(
         #[serde(skip_serializing_if = "Option::is_none")]
         caches: Option<Vec<caches::Cache>>,
         roots: &'a [PathBuf],
-        volumes: Vec<docker::Volume>,
+        #[serde(flatten)]
+        docker: docker::Snapshot,
     }
     let out = Out {
         artifacts: shown,
         caches,
         roots,
-        volumes,
+        docker,
     };
     println!(
         "{}",
         serde_json::to_string_pretty(&out).expect("paths and strings always serialize")
     );
+}
+
+/// Docker's part of the listing: images and volumes, or everything by image with -group image. `only` is when
+/// -images or -volumes asked for just these: then only what they name is shown, and an empty result is said.
+fn print_docker(d: &docker::Snapshot, o: &Options, only: bool) {
+    let images = !only || o.images;
+    let volumes = !only || o.volumes;
+    let mut first = only;
+    let mut gap = || {
+        if !std::mem::take(&mut first) {
+            println!();
+        }
+    };
+    if o.by_image && images && !d.images.is_empty() {
+        gap();
+        print_docker_by_image(d);
+        return;
+    }
+    if images && !d.images.is_empty() {
+        gap();
+        print_images(&d.images);
+    }
+    if volumes && !d.volumes.is_empty() {
+        gap();
+        print_volumes(&d.volumes.iter().collect::<Vec<_>>(), "Docker volumes");
+    }
+    if only && first {
+        println!("{}", dim("nothing in Docker (or Docker isn't running)"));
+    }
 }
 
 /// The summary, then each root's artifacts as a table or a tree, grouped as asked.

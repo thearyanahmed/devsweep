@@ -6,7 +6,7 @@ use std::process::Command;
 use crate::Options;
 use crate::caches::Cache;
 use crate::cmd::on_path;
-use crate::docker::Volume;
+use crate::docker::{Removable, Snapshot};
 use crate::output::{bold, dim, human, paint, plural, rel, tilde};
 use crate::rules::{Safety, exists};
 use crate::scan::{Artifact, measure};
@@ -195,7 +195,7 @@ pub fn run_clean(
     roots: &[PathBuf],
     arts: &[&Artifact],
     caches: &[Cache],
-    volumes: &[Volume],
+    docker: &Snapshot,
     o: &Options,
 ) -> i32 {
     let root = &roots[0];
@@ -247,8 +247,11 @@ pub fn run_clean(
     if !caches.is_empty() {
         clean_caches(caches, o, &mut runner);
     }
-    if !volumes.is_empty() {
-        clean_volumes(volumes, &mut runner);
+    if o.images && !docker.images.is_empty() {
+        clean_removable("Docker images", &docker.images, &mut runner);
+    }
+    if o.volumes && !docker.volumes.is_empty() {
+        clean_removable("Docker volumes", &docker.volumes, &mut runner);
     }
     report_left_alone(root, &p);
 
@@ -310,29 +313,29 @@ fn clean_caches(caches: &[Cache], o: &Options, runner: &mut Runner) {
     }
 }
 
-/// Offers each Docker volume no container uses, one by one. Docker won't remove the others, so they're only named,
-/// with what stands in the way.
-fn clean_volumes(volumes: &[Volume], runner: &mut Runner) {
-    println!("\n{}  asked one by one", bold("Docker volumes"));
-    for v in volumes {
-        let Some(argv) = v.clean_cmd() else {
-            let why = format!("({}: {})", v.why, v.blocker());
-            println!("  {}  {}  {}", dim("skipped"), v.name, dim(&why));
+/// Offers each Docker image or volume no container uses, one by one. Docker won't remove the others, so they're only
+/// named, with what stands in the way.
+fn clean_removable<R: Removable>(title: &str, items: &[R], runner: &mut Runner) {
+    println!("\n{}  asked one by one", bold(title));
+    for r in items {
+        let Some(argv) = r.clean_cmd() else {
+            let why = format!("({}: {})", r.why(), r.blocker());
+            println!("  {}  {}  {}", dim("skipped"), r.label(), dim(&why));
             continue;
         };
         let j = Job {
-            label: v.name.clone(),
+            label: r.label().to_owned(),
             dir: PathBuf::new(),
             argv,
             paths: vec![],
-            before: v.bytes,
+            before: r.bytes(),
         };
         let question = format!(
             "{}  {} {}?{}",
-            v.name,
-            human(v.bytes),
+            r.label(),
+            human(r.bytes()),
             dim(&format!("via {}", j.method())),
-            dim(&format!("  {}", v.why))
+            dim(&format!("  {}", r.why()))
         );
         if runner.dry(&j) || ask(&question) {
             runner.run(&j);
