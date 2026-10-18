@@ -467,7 +467,7 @@ impl Sweeper for Docker {
         ]
     }
 
-    fn list(&self) -> Vec<Item> {
+    fn list(&self, _roots: &[PathBuf]) -> Vec<Item> {
         items(snapshot())
     }
 }

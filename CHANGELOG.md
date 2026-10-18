@@ -7,10 +7,11 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- With no folders named, devsweep scans whichever of `~/dev`, `~/code`, `~/projects`, `~/src` and `~/Developer` exist,
-  instead of failing when there's no `~/dev`. Named folders are checked first: a missing, unreadable or
-  macOS-protected one stops devsweep with the reason.
+- `Sweeper::list` is given the folders being scanned.
 
+- With no folders named, devsweep scans your home folder instead of `~/dev`, skipping `~/Library`, hidden folders at
+  its top, the media folders and Photos libraries; `clean` accepts the home folder too. Named folders are checked
+  first: a missing, unreadable or macOS-protected one stops devsweep with the reason.
 - `--include-caution` is replaced by `-upto safe|caution|unsafe`. `-upto unsafe` can clean folders git tracks files
   in: one by one, each confirmed by typing its name (never by `-y`), and only with no uncommitted changes in it.
 
@@ -20,6 +21,9 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rebuild command and why it isn't safe.
 
 ### Added
+
+- Old toolchains with `-toolchains`: rustup, nvm, fnm, volta, pyenv, mise and SDKMAN versions, except the default,
+  the one on PATH and any a project pins (`.nvmrc`, `rust-toolchain.toml`, `.tool-versions`, ...).
 
 - `devsweep why`: the disk's size and free space, what devsweep can reclaim by part with the command for each, what
   Docker's VM disk takes against what Docker counts in use, and Time Machine's local snapshots.

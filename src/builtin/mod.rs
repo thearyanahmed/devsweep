@@ -11,6 +11,7 @@ mod python;
 mod rust;
 mod simulators;
 mod swift;
+mod toolchains;
 mod zig;
 
 pub(crate) use docker::VmDisk;
@@ -31,6 +32,7 @@ pub(crate) fn register(r: &mut Registry) {
     r.add(docker::Docker);
     r.add(models::Models);
     r.add(caches::Caches);
+    r.add(toolchains::Toolchains);
 }
 
 /// The VM disks of the Docker engines installed, for `devsweep why`.

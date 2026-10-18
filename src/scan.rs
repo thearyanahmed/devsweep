@@ -144,7 +144,7 @@ fn find(dir: &Path, registry: &Registry, found: &mut Vec<Artifact>) {
             continue;
         }
         let name = e.file_name().to_string_lossy().into_owned();
-        if name == ".git" {
+        if name == ".git" || skipped(dir, &name) {
             continue;
         }
         let path = e.path();
@@ -167,6 +167,25 @@ fn find(dir: &Path, registry: &Registry, found: &mut Vec<Artifact>) {
             clean: claim.clean,
         });
     }
+}
+
+/// Folders the walk leaves alone: in the home folder, the hidden ones (tools' own state, whose caches -caches lists)
+/// and the ones that hold no projects but a lot of files (~/Library, ~/Music, ...); anywhere, a Photos library.
+pub(crate) fn skipped(dir: &Path, name: &str) -> bool {
+    const HOME_SKIP: &[&str] = &[
+        "Applications",
+        "Library",
+        "Movies",
+        "Music",
+        "Pictures",
+        "Public",
+    ];
+    if name.ends_with(".photoslibrary") {
+        return true;
+    }
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+    home.is_some_and(|h| Path::new(&h) == dir)
+        && (name.starts_with('.') || HOME_SKIP.contains(&name))
 }
 
 #[derive(Default)]

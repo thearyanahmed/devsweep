@@ -95,6 +95,7 @@ fn parts(arts: &[Artifact], items: &[Item]) -> Vec<(&'static str, Part, &'static
     let mut docker = Part::default();
     let mut models = Part::default();
     let mut caches = Part::default();
+    let mut toolchains = Part::default();
     for i in items
         .iter()
         .filter(|i| i.safety != Safety::Unsafe && !matches!(i.clean, Clean::Blocked(_)))
@@ -102,6 +103,7 @@ fn parts(arts: &[Artifact], items: &[Item]) -> Vec<(&'static str, Part, &'static
         let part = match i.kind.as_str() {
             "docker image" | "docker volume" => &mut docker,
             "model" => &mut models,
+            "toolchain" => &mut toolchains,
             // docker system prune's share is Docker's images and volumes again, counted above.
             "cache" if !matches!(&i.clean, Clean::Tool(argv) if argv.first().is_some_and(|c| c == "docker")) => {
                 &mut caches
@@ -119,6 +121,7 @@ fn parts(arts: &[Artifact], items: &[Item]) -> Vec<(&'static str, Part, &'static
         ),
         ("local models", models, "devsweep clean -models"),
         ("shared caches", caches, "devsweep clean -caches"),
+        ("old toolchains", toolchains, "devsweep clean -toolchains"),
     ]
 }
 

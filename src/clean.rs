@@ -329,7 +329,11 @@ fn clean_items(
         let path = i.path.clone();
         let (argv, dir) = match &i.clean {
             Clean::Blocked(blocker) => {
-                let why = format!("({}: {blocker})", i.why);
+                let why = if i.why.is_empty() {
+                    format!("({blocker})")
+                } else {
+                    format!("({}: {blocker})", i.why)
+                };
                 println!("  {}  {}  {}", dim("skipped"), i.label, dim(&why));
                 continue;
             }
@@ -510,22 +514,16 @@ fn home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Refuses to clean as root, or with `/` or the home folder itself as a folder to scan.
+/// Refuses to clean as root, or with `/` as a folder to scan. The home folder is fine: it's the default, and rm -rf
+/// still never deletes it, only real folders inside it that a sweeper claimed.
 pub(crate) fn preflight(roots: &[PathBuf]) -> Result<(), String> {
     let root_user = std::env::var_os("SUDO_UID").is_some()
         || crate::cmd::output("id", &["-u"]).is_some_and(|uid| uid == "0");
     if root_user {
         return Err("refusing to clean as root (or under sudo): run it as yourself".into());
     }
-    let home = home();
-    if let Some(r) = roots
-        .iter()
-        .find(|r| r.as_path() == Path::new("/") || Some(*r) == home.as_ref())
-    {
-        return Err(format!(
-            "refusing to clean with {} as a folder to scan: name the folders that hold your projects",
-            r.display()
-        ));
+    if roots.iter().any(|r| r.as_path() == Path::new("/")) {
+        return Err("refusing to clean with / as a folder to scan: name the folders that hold your projects".into());
     }
     Ok(())
 }
@@ -638,10 +636,10 @@ mod tests {
     }
 
     #[test]
-    fn clean_refuses_slash_and_home_as_roots() {
+    fn clean_refuses_slash_as_a_root() {
         assert!(preflight(&[PathBuf::from("/")]).is_err());
         if let Some(home) = home() {
-            assert!(preflight(&[home.join("dev"), home]).is_err());
+            assert!(preflight(&[home.join("dev"), home]).is_ok());
         }
     }
 

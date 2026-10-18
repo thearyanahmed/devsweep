@@ -31,7 +31,7 @@ impl Sweeper for Models {
         }]
     }
 
-    fn list(&self) -> Vec<Item> {
+    fn list(&self, _roots: &[PathBuf]) -> Vec<Item> {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
         let mut items = ollama(&home);
         // LM Studio 0.3 and later keep models in ~/.lmstudio; older ones in ~/.cache/lm-studio.

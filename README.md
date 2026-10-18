@@ -36,7 +36,7 @@ make build      # or just build ./devsweep
 ## Usage
 
 ```sh
-devsweep                          # your code folders (~/dev, ~/code, ...), then Docker and local models
+devsweep                          # your home folder, then Docker and local models
 devsweep ~/dev ~/work             # only these folders, any number; Docker left out
 devsweep -pwd                     # the folder you are in
 devsweep -tree                    # the same as a tree of folders: size, safety, clean command
@@ -47,6 +47,7 @@ devsweep -older 30d -kind rust    # only Rust projects not built for a month
 devsweep -caches                  # also the shared caches: cargo, go, npm, pnpm, brew, ...
 devsweep -images -volumes         # only Docker
 devsweep -models                  # only local AI models: Ollama, LM Studio
+devsweep -toolchains              # also old Rust, Node, Python and Java versions
 devsweep -json                    # everything, for scripts
 
 devsweep why                      # where the disk went, on one screen
@@ -59,10 +60,12 @@ devsweep clean -caches -images    # also offers caches and Docker images, one by
 devsweep clean -upto caution      # also caution artifacts (dist/, no lockfile), one by one
 ```
 
-With no folders named, devsweep scans whichever of `~/dev`, `~/code`, `~/projects`, `~/src` and `~/Developer` exist.
-A folder you name must exist and be readable, or devsweep stops and says which and why. On macOS that includes
-`~/Desktop`, `~/Documents` and `~/Downloads`, which your terminal needs access to in System Settings > Privacy &
-Security.
+With no folders named, devsweep scans your home folder, wherever your projects are: `~/dev`, `~/Desktop`, a repo
+cloned into `~/Downloads` and forgotten. It skips what holds no projects: `~/Library`, the hidden folders at the top of
+home (tools' own state; `-caches` covers their caches), `~/Applications`, `~/Music`, `~/Movies`, `~/Pictures`,
+`~/Public` and Photos libraries. A folder you name must exist and be readable, or devsweep stops and says which and
+why. On macOS your terminal may first need access to `~/Desktop`, `~/Documents` and `~/Downloads` (System Settings >
+Privacy & Security); a folder it can't read is skipped.
 
 Flags go before or after the folders. One-word flags take one dash (`-tree`), several words two (`--dry-run`); a
 one-word flag also takes two. `-h` lists them all.
@@ -134,7 +137,7 @@ what was only shown. A command that fails doesn't count as freed.
 Some things it refuses outright, whatever a sweeper says:
 
 - running `clean` as root or under `sudo`;
-- `/` or your home folder as a folder to scan;
+- `/` as a folder to scan (your home folder is fine: rm -rf never deletes it, only folders inside it);
 - an `rm -rf` of anything but a real folder (not a symlink) strictly inside a scanned folder or your home folder,
   never one of those itself, checked again right before deleting.
 
@@ -146,14 +149,14 @@ Some things it refuses outright, whatever a sweeper says:
 Disk  228.2 GiB, 80.2 GiB used, 148.0 GiB free
 
 Reclaimable  2.9 GiB  (2.8 GiB of it safe)
-  511.5 MiB   projects in ~/dev        435.0 MiB safe; devsweep clean -rm -upto caution
+  511.5 MiB   projects in ~            435.0 MiB safe; devsweep clean -rm -upto caution
   2.4 GiB     shared caches            2.4 GiB safe; devsweep clean -caches
 ```
 
 - **Disk**: the size, used and free space of the disk your home folder is on.
 - **Reclaimable**: everything devsweep can clean, safe and caution (never unsafe), by part, each with the command that
-  cleans it: projects, Docker images and volumes, local models and the shared caches, all counted whether or not
-  their flag was given.
+  cleans it: projects, Docker images and volumes, local models, the shared caches and old toolchains, all counted
+  whether or not their flag was given.
 - **Docker's VM disk**: Docker Desktop, OrbStack, Colima and Rancher Desktop keep containers in one disk image.
   Pruning frees space inside it, which isn't always given back to macOS: devsweep shows what the image takes on disk
   and, with one engine, how much more that is than what Docker counts in use.
@@ -200,6 +203,23 @@ Downloaded AI models are listed after Docker, as caution: one is often 4 to 40 G
 - **LM Studio**: its models folder, `~/.lmstudio/models` or the older `~/.cache/lm-studio/models`, removed with rm -rf.
 
 `-models` lists only them, and with `clean` offers each one. Like Docker, they're left out when you name folders.
+
+## Old toolchains
+
+`-toolchains` adds the versions version managers keep installed: rustup's Rust toolchains, nvm's, fnm's and volta's
+Node versions, pyenv's Pythons, mise's installs of any tool, and SDKMAN's JDKs and friends. A version is kept, listed
+but never offered, when it is:
+
+- the manager's default (rustup's default toolchain, nvm's `default` alias, fnm's, volta's, pyenv's global, SDKMAN's
+  `current`, mise's global config);
+- the `node` or `python3` on PATH;
+- pinned by a project under the scanned folders: `rust-toolchain(.toml)`, `.nvmrc`, `.node-version`,
+  `.python-version`, `.tool-versions`, `.sdkmanrc` or `mise.toml`. A partial pin (`20`, `3.11`) keeps every version it
+  could mean.
+
+The rest are caution: a project outside the scanned folders may still need one. They're removed with the manager's
+own command (`rustup toolchain uninstall`, `fnm uninstall`, `pyenv uninstall -f`, `mise uninstall`), or with rm -rf
+for nvm, volta and SDKMAN, which have none devsweep can run.
 
 ## Shared caches
 
@@ -263,6 +283,7 @@ Output is colored on a terminal and plain otherwise, or with `NO_COLOR` set.
 | `-pwd` | the current folder instead of the default ones, as if named; with folders, it is added to them |
 | `-rm` | clean: also offer what only rm -rf removes (`node_modules`, `.next`, ...) |
 | `-sort` | `size` (default), `age` or `path`, optionally with `:asc` or `:desc` |
+| `-toolchains` | also list old toolchains (rustup, nvm, fnm, volta, pyenv, mise, SDKMAN); with clean, offer each one |
 | `-tree` | a tree instead of a table: each artifact's size, safety and clean command |
 | `-upto` | clean: the least safe artifacts to offer: `safe` (default), `caution` (each asked) or `unsafe` (each typed out, never by `-y`) |
 | `-volumes` | only Docker volumes; with clean, offer each one |
@@ -294,7 +315,8 @@ For anything smarter, implement `Sweeper` yourself:
 
 - `dirs` and `claim` for folders met while walking: say whether a folder is yours, how safe removing it is, how it's
   cleaned (`Clean::Tool`, `Clean::RemoveDir` or `Clean::Blocked`) and rebuilt.
-- `list` and `sections` for things found on their own, outside any project (a cache, Docker's images): return
+- `list` and `sections` for things found on their own, outside any project (a cache, Docker's images), given the
+  folders being scanned: return
   `Item`s, and describe the table they're listed in.
 
 The engine does the rest: walking, measuring, rendering, asking before cleaning, and the safety net, which a sweeper

@@ -171,8 +171,9 @@ pub trait Sweeper: Send + Sync {
         None
     }
 
-    /// The things it finds on its own, outside any project: caches, Docker's images.
-    fn list(&self) -> Vec<Item> {
+    /// The things it finds on its own, outside any project: caches, Docker's images. `roots` are the folders being
+    /// scanned, for a sweeper that needs to know what projects there use (the toolchains they pin).
+    fn list(&self, _roots: &[PathBuf]) -> Vec<Item> {
         Vec::new()
     }
 

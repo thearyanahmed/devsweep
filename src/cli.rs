@@ -86,7 +86,7 @@ const FLAGS: &[Flag] = &[
     ),
     flag(
         "pwd",
-        "the current folder instead of the default ones, as if given as a folder",
+        "the current folder instead of your home folder, as if given as a folder",
     ),
     flag(
         "rm",
@@ -96,6 +96,10 @@ const FLAGS: &[Flag] = &[
         "sort",
         "size",
         "size, age or path, each its natural way round; add :asc or :desc to choose, e.g. size:asc",
+    ),
+    flag(
+        "toolchains",
+        "also list old toolchains (rustup, nvm, fnm, volta, pyenv, mise, SDKMAN); with clean, offer each one",
     ),
     flag("tree", "show a tree instead of a table"),
     string(
@@ -178,7 +182,7 @@ fn help() -> String {
         bold("devsweep"),
         dim(": what your projects' build output is costing you, and cleaning it up."),
         bold("Usage:"),
-        dim("list artifacts (default: ~/dev, ~/code, ~/projects, ~/src, ~/Developer)"),
+        dim("list artifacts (default dir: your home folder)"),
         dim("clean them, after asking"),
         dim("where the disk went: free space, what devsweep can reclaim, Docker's VM disk"),
         dim(
@@ -367,19 +371,15 @@ fn options(set: &BTreeMap<&'static str, String>) -> Options {
     }
 }
 
-/// Where projects usually live, scanned when no folders are named: whichever of these exist under the home folder.
-const DEFAULT_ROOTS: &[&str] = &["dev", "code", "projects", "src", "Developer"];
-
-/// The folders to scan as absolute paths. Named ones must be folders devsweep can read, or it exits saying which and
-/// why; with none named, the [`DEFAULT_ROOTS`] that exist, which may be none.
+/// The folders to scan as absolute paths: the home folder when none are named, which the walk skips ~/Library, hidden
+/// folders and the media folders of. Named ones must be folders devsweep can read, or it exits saying which and why.
 fn resolve_roots(dirs: &[String]) -> Vec<PathBuf> {
     if dirs.is_empty() {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-        return DEFAULT_ROOTS
-            .iter()
-            .map(|d| home.join(d))
-            .filter(|d| readable(d).is_ok())
-            .collect();
+        if let Err(why) = readable(&home) {
+            fail(format!("your home folder, {}: {why}", home.display()));
+        }
+        return vec![home];
     }
     dirs.iter()
         .map(|d| {
@@ -419,18 +419,6 @@ fn access(e: &std::io::Error) -> String {
     e.to_string()
 }
 
-/// Says why nothing was scanned when no folders were named and none of the usual ones exist.
-fn no_roots_note() {
-    let tried: Vec<String> = DEFAULT_ROOTS.iter().map(|d| format!("~/{d}")).collect();
-    println!(
-        "{}",
-        dim(&format!(
-            "no project folders: none of {} exists; name the folders that hold yours, e.g. devsweep ~/work",
-            tried.join(", ")
-        ))
-    );
-}
-
 /// Runs devsweep with the command line it was started with, and exits.
 ///
 /// # Panics
@@ -460,6 +448,7 @@ pub fn run(registry: &Registry) {
     // Where the disk went takes in everything devsweep can find, not just what the listing shows by default.
     if why {
         o.switches.insert("caches");
+        o.switches.insert("toolchains");
         o.scoped = false;
     }
     let roots = resolve_roots(&dirs);
@@ -485,9 +474,6 @@ pub fn run(registry: &Registry) {
         return;
     }
     if clean {
-        if roots.is_empty() {
-            no_roots_note();
-        }
         let offered: Vec<(Section, Vec<&Item>)> = sections
             .iter()
             .filter(|sec| sec.listed && (sec.flag.is_none() || o.flag_on(sec.flag)))
@@ -539,7 +525,7 @@ fn gather(
         let listing: Vec<_> = registry
             .listers()
             .filter(|s| wanted(*s))
-            .map(|s| scope.spawn(move || measured(s.list())))
+            .map(|s| scope.spawn(move || measured(s.list(roots))))
             .collect();
         let all = if only {
             Vec::new()
@@ -656,10 +642,6 @@ fn print_json(roots: &[PathBuf], shown: &[&Artifact], items: &[Item]) {
 
 /// The summary, then each root's artifacts as a table or a tree, grouped as asked.
 fn print_listing(roots: &[PathBuf], all: &[Artifact], shown: &[&Artifact], o: &Options) {
-    if roots.is_empty() {
-        no_roots_note();
-        return;
-    }
     // The summary heads the listing: the note and the table or tree follow it directly.
     summary(roots, shown);
     if all.is_empty() {

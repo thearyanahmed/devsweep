@@ -192,7 +192,7 @@ mod tests {
             }]
         }
 
-        fn list(&self) -> Vec<Item> {
+        fn list(&self, _roots: &[PathBuf]) -> Vec<Item> {
             vec![Item {
                 path: Some(PathBuf::from("/nonexistent/thumbnails")),
                 ..Item::new("thumbnail cache", "thumbnails", Clean::RemoveDir)
@@ -204,7 +204,7 @@ mod tests {
     fn a_sweeper_can_list_things_outside_projects() {
         let mut registry = Registry::new();
         registry.add(Thumbnails);
-        let items = Thumbnails.list();
+        let items = Thumbnails.list(&[]);
         assert_eq!(items[0].kind, Thumbnails.sections()[0].kind);
         assert_eq!(items[0].id, "thumbnails");
         assert_eq!(items[0].safety, Safety::Safe);

@@ -371,7 +371,7 @@ impl Sweeper for Caches {
         }]
     }
 
-    fn list(&self) -> Vec<Item> {
+    fn list(&self, _roots: &[PathBuf]) -> Vec<Item> {
         let runtimes = thread::spawn(simulators::runtimes);
         let mut items: Vec<Item> = caches()
             .into_iter()
